@@ -1,0 +1,790 @@
+
+
+# Load libraries 
+```{r libraries, message=FALSE, warning=FALSE, paged.print=FALSE, results="hide"}
+### Load required packages
+library(ggplot2)
+library(phyloseq)
+library(readxl)
+library(vegan)
+library(ggpubr)
+library(tidyverse)
+library(EnvStats)
+library(rstatix)
+library(ggbeeswarm)
+library(effects)
+library(modelsummary)
+library(speedyseq)
+library(MicEco)
+library(ggh4x)
+library(sjPlot)
+library(permute)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(dplyr)
+library(tidyr)
+library(tidybayes)
+library(forcats)
+library(ggplot2)
+
+
+```
+
+# Load phyloseq objects
+```{r load phyloseq objects}
+physeq_LT <- readRDS("LT_physeq_scrub_0.98clustered.rds") %>%
+  subset_samples(!(animalID %in% c("EO4.2_MR", "EO4.2_ML", "EO4.6_ML", "EO4.2_MN", "EO4.7_MN", "EO4.11_FR", "EO4.5_FN"))) %>% # remove mice that died during experiment
+  rename_sample_data(mouseID = animalID) %>% 
+    mutate_sample_data(
+      weeks_on_diet = age_weeks - 5,
+      weeks_on_diet_factor = as.factor(weeks_on_diet),
+      treatment = ifelse(treatment == "Control", "Ctrl", treatment),
+      diet = str_replace(diet, "HF", "HFD"),
+      treatment_diet = paste(treatment, diet, sep = "_")
+    )
+
+physeq_ST <- readRDS("ST_physeq_scrub_0.98clustered.rds") %>%
+  rename_sample_data(mouseID = animal_ID) %>% 
+  mutate_sample_data(
+    weeks_on_diet = age_weeks - 6, 
+    weeks_on_diet_factor = as.factor(weeks_on_diet),
+    diet = str_replace(diet, "HF", "HFD"), 
+    diet = str_replace(diet, "CTRL", "CD"), 
+    diet_new = if_else(timepoint %in% c("t0", "t1"), "chow", diet),
+    diet_new = factor(diet_new, levels = c("chow", "CD", "HFD")), 
+    treatment_diet_new = paste(treatment, diet_new, sep = "_"),
+    treatment_diet_new = factor(treatment_diet_new, levels = c("Ctrl_chow", "Ctrl_CD", "Ctrl_HFD", "Hp_chow", "Hp_CD", "Hp_HFD")), 
+    sample_type = if_else(timepoint == "t4" & sample_type == "fecal", "colon", sample_type)
+  )
+
+```
+
+```{r add Hp loads to phyloseq objects}
+# Load Hp loads data
+MS1_Hp_loads <- read_xlsx("MS1_Hp_loads.xlsx") %>%
+  select(mouseID, experiment, total_bact_load, avg_copies, total_Hp_abund, total_DNA_conc, Hp_copies_std) 
+
+# subset Hp loads data by experiment
+MS1_Hp_loads_LT <- MS1_Hp_loads %>% 
+  filter(experiment == "LT") %>%
+  select(-experiment)
+MS1_Hp_loads_ST <- MS1_Hp_loads %>% 
+  filter(experiment == "ST") %>%
+  select(-experiment)
+
+# Add Hp loads to phyloseq objects
+physeq_LT <- physeq_LT %>% 
+  inner_join_sample_data(MS1_Hp_loads_LT, by = "mouseID") 
+physeq_ST <- physeq_ST %>% 
+  inner_join_sample_data(MS1_Hp_loads_ST, by = "mouseID") 
+
+```
+
+
+## prune and transform phyloseq objects 
+```{r prune-taxa}
+# For physeq_LT
+physeq_LT_trans_abund_subset <- physeq_LT %>%
+  ps_prune(min.samples = 3) %>%  # keeps only ASVs present in at least 3 samples
+  prune_taxa(taxa_sums(.) > 0, .) %>%  # Removes taxa with zero abundance across all samples
+  transform_sample_counts(function(x) x / sum(x)) %>%  # Transforms the counts to relative abundances by dividing each count by the total counts in that sample
+  filter_taxa(function(x) mean(x) > 0.001, TRUE) %>%  # Filters out taxa with a mean relative abundance of 0.1% or less
+  subset_taxa(Kingdom != "unassigned" & Family != "Mitochondria") %>%  # Removes taxa that are unassigned at the Kingdom level or belong to the Mitochondria family
+  prune_samples(sample_sums(.) > 0, .)  # remove empty samples
+
+# For physeq_ST
+physeq_ST_trans_abund_subset <- physeq_ST %>%
+  ps_prune(min.samples = 3) %>%  
+  prune_taxa(taxa_sums(.) > 0, .) %>%  
+  transform_sample_counts(function(x) x / sum(x)) %>%   
+  filter_taxa(function(x) mean(x) > 0.001, TRUE) %>%  
+  subset_taxa(Kingdom != "unassigned" & Family != "Mitochondria") %>%
+  prune_samples(sample_sums(.) > 0, .) 
+
+```
+
+## Short-term 
+### fecal samples
+```{r ST: prepare fecal physeq object}
+# Subset samples to include only fecal samples and non-NA treatments
+physeq_ST_fecal <- physeq_ST_trans_abund_subset  %>%
+  subset_samples(!is.na(treatment)) %>%
+  subset_samples(timepoint != "t4") 
+```
+
+```{r ST: plot fecal beta diversity (Bray-Curtis)}
+# Perform PCoA ordination using Bray-Curtis distance
+physeq_ST_fecal_bray <- ordinate(physeq_ST_fecal, method = "PCoA", distance = "bray")
+
+# Rename PCoA axes
+colnames(physeq_ST_fecal_bray$vectors)[1:2] <- c("PCoA1", "PCoA2")
+
+# Plot ordination
+plot_physeq_ST_fecal_bray <- plot_ordination(physeq_ST_fecal, physeq_ST_fecal_bray, type = "samples", color = "weeks_on_diet_factor", shape = "treatment") +
+  theme_classic() +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+  scale_color_manual(values = c("-2" = "#000099", "0" = "#0066ff", "1" = "#99ccff")) +
+  scale_shape_manual(values = c("Ctrl" = 17, "Hp" = 19), labels = c("Ctrl" = "Control", "Hp" = expression(italic("H. pylori")))) +
+  geom_point(size = 2) +
+  theme(legend.position = "none",
+        axis.text = element_text(color = "white"),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+# Extract PCoA coordinates
+colnames(physeq_ST_fecal_bray$vectors)[1:2] <- c("PCoA1", "PCoA2")
+physeq_ST_fecal_bray_coords <- physeq_ST_fecal_bray$vectors[, c("PCoA1", "PCoA2")]
+
+# Combine with sample data
+physeq_ST_fecal_sampledata <- data.frame(sample_data(physeq_ST_fecal))
+physeq_ST_fecal_bray_coords_df <- cbind(physeq_ST_fecal_sampledata, physeq_ST_fecal_bray_coords)
+
+# Create boxplot for PCoA1
+plot_physeq_ST_fecal_bray_pcoa1 <- ggplot(physeq_ST_fecal_bray_coords_df, aes(x = diet_new, y = PCoA1)) +
+  coord_flip() +
+  geom_jitter(aes(color = weeks_on_diet_factor, shape = treatment), height = 0, width = 0.2, alpha = 0.5, size = 2) +
+  geom_boxplot(outlier.shape = NA, fill = "transparent") +
+  scale_shape_manual(values = c("Ctrl" = 17, "Hp" = 19), labels = c("Ctrl" = "Control", "Hp" = expression(italic("H. pylori")))) +
+  scale_color_manual(values = c("-2" = "#000099", "0" = "#0066ff", "1" = "#99ccff")) +
+  labs(x = "", y = "PCoA1 [29 %]", color = "Time on diet (weeks)", shape = "Treatment") +
+  theme_classic() +
+  theme(axis.title.y = element_blank(), legend.position = "none")
+
+# Create boxplot for PCoA2
+plot_physeq_ST_fecal_bray_pcoa2 <- ggplot(physeq_ST_fecal_bray_coords_df, aes(x = diet_new, y = PCoA2)) +
+  geom_jitter(aes(color = weeks_on_diet_factor, shape = treatment), height = 0, width = 0.2, alpha = 0.5, size = 2) +
+  geom_boxplot(outlier.shape = NA, fill = "transparent") +
+  scale_shape_manual(values = c("Ctrl" = 17, "Hp" = 19), labels = c("Ctrl" = "Control", "Hp" = expression(italic("H. pylori")))) +
+  scale_color_manual(values = c("-2" = "#000099", "0" = "#0066ff", "1" = "#99ccff")) +
+  labs(x = "", y = "PCoA1 [11.3 %]", color = "Time on diet (weeks)", shape = "Treatment") +
+  theme_classic() +
+  theme(axis.title.x = element_blank(), legend.position = "none")
+
+# Arrange the plots
+plot_physeq_ST_fecal_betadiv <- ggarrange(plot_physeq_ST_fecal_bray_pcoa2, plot_physeq_ST_fecal_bray, NULL, plot_physeq_ST_fecal_bray_pcoa1,
+                          ncol = 2, 
+                          nrow = 2, 
+                          heights = c(3, 1), 
+                          widths = c(1, 3), 
+                          align = "hv",
+                          common.legend = TRUE,
+                          legend = "right")
+
+plot_physeq_ST_fecal_betadiv
+```
+
+
+```{r}
+#Bayesian analysis of betadiversity of fecal samples
+#Extract Bray–Curtis distance matrix
+bray_dist <- phyloseq::distance(physeq_ST_fecal, method = "bray")
+bray_mat  <- as.matrix(bray_dist)
+
+#Extract sample metadata
+meta <- data.frame(sample_data(physeq_ST_fecal), check.names = FALSE)
+meta$sampleID <- rownames(meta)
+meta$sampleID <- as.character(meta$sampleID)
+rownames(meta) <- NULL
+
+#Convert to long format (pairwise distances)
+bray_mat <- as.matrix(phyloseq::distance(physeq_ST_fecal, method = "bray"))
+
+bray_long <- expand.grid(
+  sample_i = rownames(bray_mat),
+  sample_j = colnames(bray_mat),
+  stringsAsFactors = FALSE
+)
+
+bray_long$bray <- bray_mat[
+  cbind(match(bray_long$sample_i, rownames(bray_mat)),
+        match(bray_long$sample_j, colnames(bray_mat)))
+]
+
+bray_long <- bray_long[bray_long$sample_i < bray_long$sample_j, ]
+
+
+meta_i <- meta
+names(meta_i) <- paste0(names(meta_i), "_i")
+
+meta_j <- meta
+names(meta_j) <- paste0(names(meta_j), "_j")
+
+bray_long <- merge(
+  bray_long,
+  meta_i,
+  by.x = "sample_i",
+  by.y = "sampleID_i",
+  all.x = TRUE
+)
+
+bray_long <- merge(
+  bray_long,
+  meta_j,
+  by.x = "sample_j",
+  by.y = "sampleID_j",
+  all.x = TRUE
+)
+
+
+# Compute raw time difference
+bray_long <- bray_long %>%
+  mutate(time_diff = abs(weeks_on_diet_i - weeks_on_diet_j))
+
+#Center and  scale
+bray_long <- bray_long %>%
+  mutate(
+    time_diff = abs(weeks_on_diet_i - weeks_on_diet_j),
+    time_diff_z = as.numeric(scale(time_diff)),
+    both_post_diet = weeks_on_diet_i >= 0 & weeks_on_diet_j >= 0,
+    one_post_diet  = xor(weeks_on_diet_i >= 0, weeks_on_diet_j >= 0)
+  )
+
+bray_long <- bray_long %>%
+  select(-time_diff)
+
+bray_wm <- bray_long %>%
+  filter(mouseID_i == mouseID_j)
+nrow(bray_wm)
+
+
+
+bray_wm <- bray_wm %>%
+  mutate(
+    sex_pair = case_when(
+      sex_i == "male" & sex_j == "male" ~ "both_male",
+      sex_i == "female" & sex_j == "female" ~ "both_female",
+      TRUE ~ "mixed"
+    )
+  )
+
+
+bray_wm <- bray_wm %>%
+  mutate(
+    diet_stage_i = case_when(diet_i == "chow" ~ 0,
+                             diet_i %in% c("CD","HFD") ~ 1),
+    diet_stage_j = case_when(diet_j == "chow" ~ 0,
+                             diet_j %in% c("CD","HFD") ~ 1),
+    diet_stage_pair = (diet_stage_i + diet_stage_j)/2,
+    both_post_diet = weeks_on_diet_i >= 0 & weeks_on_diet_j >= 0,
+    one_post_diet  = xor(weeks_on_diet_i >= 0, weeks_on_diet_j >= 0),
+    sex_pair = case_when(sex_i == "male" & sex_j == "male" ~ "both_male",
+                         sex_i == "female" & sex_j == "female" ~ "both_female",
+                         TRUE ~ "mixed"),
+    infection_pair = case_when(treatment_i == "Hp" & treatment_j == "Hp" ~ "both_Hp",
+                               treatment_i == "Ctrl" & treatment_j == "Ctrl" ~ "both_Ctrl",
+                               TRUE ~ "mixed"),
+    diet_post_pair = case_when(
+      both_post_diet == FALSE ~ "Chow (pre-diet)",
+      both_post_diet == TRUE & diet_i == "CD" & diet_j == "CD" ~ "CD (post-diet)",
+      both_post_diet == TRUE & diet_i == "HFD" & diet_j == "HFD" ~ "HFD (post-diet)",
+      both_post_diet == TRUE ~ "Mixed (post-diet)"
+    )
+  )
+
+
+fit_bray_full_num <- brm(
+   bray ~ time_diff_z +
+       both_post_diet * infection_pair * sex_pair +
+       (1 + time_diff_z | mouseID_i),
+  data = bray_wm,
+  family = Beta(),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(0, 1), class = "Intercept"),
+    prior(exponential(1), class = "sd")
+  ),
+  chains = 4, iter = 4000, warmup = 2000,
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  backend = "cmdstanr"
+)
+
+
+time_seq <- seq(min(bray_wm$time_diff_z), max(bray_wm$time_diff_z), length.out = 30)
+
+
+
+pred_grid_forest <- expand.grid(
+  time_diff_z = 0,
+  sex_pair = c("both_male", "both_female"),
+  infection_pair = c("both_Hp", "both_Ctrl"),
+  diet_post_pair = c("Chow (pre-diet)", "CD (post-diet)", "HFD (post-diet)")
+) %>%
+  mutate(
+    both_post_diet = ifelse(diet_post_pair == "Chow (pre-diet)", FALSE, TRUE),
+    diet_stage_pair = ifelse(diet_post_pair == "Chow (pre-diet)", 0, 1)
+  )
+
+
+
+pred_draws_forest <- add_epred_draws(
+  fit_bray_full_num,
+  newdata = pred_grid_forest,
+  re_formula = NA,  # population-level predictions only
+  ndraws = 2000
+)
+
+
+eff_simple_treat <- pred_draws_forest %>%
+  dplyr::select(.draw, sex_pair, diet_post_pair, infection_pair, .epred) %>%
+  tidyr::pivot_wider(
+    id_cols = c(.draw, sex_pair, diet_post_pair),
+    names_from = infection_pair,
+    values_from = .epred
+  ) %>%
+  dplyr::mutate(effect = both_Hp - both_Ctrl) %>%
+  dplyr::group_by(sex_pair, diet_post_pair) %>%
+  dplyr::summarise(
+    median    = median(effect, na.rm = TRUE),
+    CI_low    = quantile(effect, 0.025, na.rm = TRUE),
+    CI_high   = quantile(effect, 0.975, na.rm = TRUE),
+    CI80_low  = quantile(effect, 0.10, na.rm = TRUE),
+    CI80_high = quantile(effect, 0.90, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Reorder diet and sex for plotting
+
+
+eff_simple_treat <- eff_simple_treat %>%
+  dplyr::mutate(
+    diet_post_pair = factor(
+      diet_post_pair,
+      levels = rev(c("Chow (pre-diet)", "CD (post-diet)", "HFD (post-diet)"))
+    ),
+    sex_pair = factor(
+      sex_pair,
+      levels = c("both_female", "both_male"),
+      labels = c("Female", "Male")
+    )
+  )
+
+dodge_eff <- position_dodge(width = 0.6)
+
+ggplot(eff_simple_treat, aes(x = diet_post_pair, y = median, color = sex_pair)) +
+  # 95% CI = thinner outer line
+  geom_linerange(
+    aes(ymin = CI_low, ymax = CI_high),
+    position = dodge_eff,
+    linewidth = 0.8,
+    alpha = 0.65
+  ) +
+  # 80% CI = thicker inner line
+  geom_linerange(
+    aes(ymin = CI80_low, ymax = CI80_high),
+    position = dodge_eff,
+    linewidth = 2.2
+  ) +
+  # median point
+  geom_point(
+    position = dodge_eff,
+    size = 2.7
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  scale_color_manual(
+    values = c("Female" = "#b19cd9", "Male" = "#6a0dad"),
+    guide = guide_legend(reverse = TRUE)
+  ) +
+  labs(
+    x = "",
+    y = "Effect of Hp Infection on Bray–Curtis distance",
+    color = "Sex"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.text.y = element_text(color = "black")
+  )
+
+
+```
+
+
+
+### GIT samples
+```{r ST: prepare physeq object for gastrointestinal (GIT) samples}
+
+# Subset samples to include only GIT samples and non-NA treatments
+physeq_ST_git <- physeq_ST_trans_abund_subset  %>%
+  subset_samples(!is.na(treatment)) %>%
+  subset_samples(timepoint == "t4")
+
+#make forest plots for colon, stomach and ileum - define plotting function
+
+make_site_beta_forest <- function(fit_site, df_pcoa_site,
+                                  ndraws = 2000,
+                                  y_label = "Centroid distance in PCoA space (Bray–Curtis)") {
+
+  
+  # prediction grid
+  grid <- tidyr::expand_grid(
+    sex       = levels(df_pcoa_site$sex),
+    diet      = levels(df_pcoa_site$diet),
+    treatment = levels(df_pcoa_site$treatment)
+  )
+
+  # posterior expected PCs (population level)
+  ep <- tidybayes::add_epred_draws(
+    grid,
+    fit_site,
+    re_formula = NA,
+    ndraws = ndraws
+  )
+
+  # widen to have PC1 and PC2 in columns
+  ep_wide <- ep %>%
+    dplyr::select(.draw, sex, diet, treatment, .category, .epred) %>%
+    tidyr::pivot_wider(names_from = .category, values_from = .epred)
+
+  # helper: Euclidean distance between two conditions within a draw
+  dist2 <- function(x1, y1, x2, y2) sqrt((x1 - x2)^2 + (y1 - y2)^2)
+
+  # Marginalize over diet (treatment main effect) and over treatment (diet main effect)
+  marg_treat <- ep_wide %>%
+    dplyr::group_by(.draw, sex, treatment) %>%
+    dplyr::summarise(PC1 = mean(PC1), PC2 = mean(PC2), .groups = "drop")
+
+  marg_diet <- ep_wide %>%
+    dplyr::group_by(.draw, sex, diet) %>%
+    dplyr::summarise(PC1 = mean(PC1), PC2 = mean(PC2), .groups = "drop")
+
+  # Main effects
+  eff_main_treat <- marg_treat %>%
+    tidyr::pivot_wider(names_from = treatment, values_from = c(PC1, PC2)) %>%
+    dplyr::mutate(effect = dist2(PC1_Hp, PC2_Hp, PC1_Ctrl, PC2_Ctrl)) %>%
+    dplyr::transmute(.draw, sex, effect, type = "Main Effects", label = "Treatment")
+
+  eff_main_diet <- marg_diet %>%
+    tidyr::pivot_wider(names_from = diet, values_from = c(PC1, PC2)) %>%
+    dplyr::mutate(effect = dist2(PC1_HFD, PC2_HFD, PC1_CD, PC2_CD)) %>%
+    dplyr::transmute(.draw, sex, effect, type = "Main Effects", label = "Diet")
+
+  # Simple effects
+  eff_simple_treat <- ep_wide %>%
+    dplyr::group_by(.draw, sex, diet) %>%
+    dplyr::summarise(
+      effect = dist2(
+        PC1[treatment == "Hp"],   PC2[treatment == "Hp"],
+        PC1[treatment == "Ctrl"], PC2[treatment == "Ctrl"]
+      ),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      type = "Simple Effects",
+      label = paste0("Treatment in ", diet)
+    )
+
+  eff_simple_diet <- ep_wide %>%
+    dplyr::group_by(.draw, sex, treatment) %>%
+    dplyr::summarise(
+      effect = dist2(
+        PC1[diet == "HFD"], PC2[diet == "HFD"],
+        PC1[diet == "CD"],  PC2[diet == "CD"]
+      ),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      type = "Simple Effects",
+      label = paste0("Diet in ", treatment)
+    )
+
+  # Interaction: difference in treatment-distance between diets
+  treat_effect_by_diet <- eff_simple_treat %>%
+    dplyr::mutate(diet = sub("^Treatment in ", "", label)) %>%
+    dplyr::select(.draw, sex, diet, effect)
+
+  eff_interaction <- treat_effect_by_diet %>%
+    tidyr::pivot_wider(names_from = diet, values_from = effect) %>%
+    dplyr::mutate(effect = HFD - CD) %>%
+    dplyr::transmute(
+      .draw, sex, effect,
+      type = "Interaction",
+      label = "Interaction"
+    )
+
+  # Combine all effect draws
+  eff_all <- dplyr::bind_rows(
+    eff_main_diet,
+    eff_main_treat,
+    eff_interaction,
+    eff_simple_diet,
+    eff_simple_treat
+  )
+
+  # Summaries for plotting with 95% and 80% intervals
+  plot_df <- eff_all %>%
+    dplyr::group_by(sex, type, label) %>%
+    dplyr::summarise(
+      median    = median(effect),
+      CI_low    = quantile(effect, 0.025),
+      CI_high   = quantile(effect, 0.975),
+      CI80_low  = quantile(effect, 0.10),
+      CI80_high = quantile(effect, 0.90),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      sex  = factor(sex, levels = c("female", "male"), labels = c("Female", "Male")),
+      type = factor(type, levels = c("Main Effects", "Interaction", "Simple Effects"))
+    )
+
+  # row order (bottom-to-top after coord_flip)
+  label_levels <- c(
+    "Diet in Ctrl",
+    "Diet in Hp",
+    "Treatment in CD",
+    "Treatment in HFD",
+    "Interaction",
+    "Diet",
+    "Treatment"
+  )
+
+  plot_df <- plot_df %>%
+    dplyr::mutate(
+      label = factor(label, levels = label_levels),
+      label = forcats::fct_rev(label)
+    )
+
+  dodge_beta <- ggplot2::position_dodge(width = 0.6)
+
+  # Forest plot with 95% thin line + 80% thick line
+  betaplot <- ggplot2::ggplot(plot_df, ggplot2::aes(x = label, y = median, color = sex)) +
+    ggplot2::geom_linerange(
+      ggplot2::aes(ymin = CI_low, ymax = CI_high),
+      position = dodge_beta,
+      linewidth = 0.8,
+      alpha = 0.65
+    ) +
+    ggplot2::geom_linerange(
+      ggplot2::aes(ymin = CI80_low, ymax = CI80_high),
+      position = dodge_beta,
+      linewidth = 2.2
+    ) +
+    ggplot2::geom_point(
+      ggplot2::aes(shape = type),
+      position = dodge_beta,
+      size = 2.7
+    ) +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dashed") +
+    ggplot2::coord_flip() +
+    ggplot2::scale_color_manual(values = c("Female" = "#b19cd9", "Male" = "#6a0dad")) +
+    ggplot2::scale_shape_manual(values = c(
+      "Main Effects"   = 16,
+      "Interaction"    = 18,
+      "Simple Effects" = 15
+    )) +
+    ggplot2::theme_bw(base_size = 12) +
+    ggplot2::theme(
+      panel.grid.major.y = ggplot2::element_blank(),
+      axis.text.y        = ggplot2::element_text(color = "black"),
+      legend.position    = "bottom",
+      legend.box         = "vertical"
+    ) +
+    ggplot2::labs(
+      x = "",
+      y = y_label,
+      color = "Sex",
+      shape = "Effect type"
+    )
+
+  list(
+    eff_all = eff_all,
+    plot_df = plot_df,
+    betaplot = betaplot
+  )
+}
+
+
+#run site-specific analyses
+run_site_pcoa_pipeline <- function(physeq, site_name,
+                                  ndraws = 2000,
+                                  chains = 4, iter = 4000, warmup = 2000,
+                                  seed = 123) {
+
+  stopifnot(inherits(physeq, "phyloseq"))
+  stopifnot(is.character(site_name), length(site_name) == 1)
+
+  # --- subset safely (avoid subset_samples NSE issues) ---
+  meta0 <- as(phyloseq::sample_data(physeq), "data.frame")
+  stopifnot("sample_type" %in% colnames(meta0))
+
+  keep_ids <- rownames(meta0)[meta0$sample_type == site_name]
+  if (length(keep_ids) == 0) {
+    stop(
+      "No samples matched site_name = '", site_name, "'. ",
+      "Available sample_type values: ",
+      paste(unique(meta0$sample_type), collapse = ", ")
+    )
+  }
+  physeq_site <- phyloseq::prune_samples(keep_ids, physeq)
+
+  # --- metadata (site) ---
+  meta_site <- as(phyloseq::sample_data(physeq_site), "data.frame") %>%
+    tibble::rownames_to_column("sampleID") %>%
+    dplyr::mutate(
+      treatment = factor(treatment, levels = c("Ctrl","Hp")),
+      sex       = factor(sex, levels = c("female","male")),
+      diet      = factor(diet, levels = c("CD","HFD"))
+    )
+
+  # --- Bray–Curtis + PCoA ---
+  bray_site <- phyloseq::distance(physeq_site, method = "bray")
+
+  pcoa_site <- cmdscale(bray_site, k = 3, eig = TRUE)
+  scores_site <- as.data.frame(pcoa_site$points)
+  colnames(scores_site) <- paste0("PC", seq_len(ncol(scores_site)))
+  scores_site$sampleID <- rownames(scores_site)
+
+  df_pcoa_site <- dplyr::inner_join(meta_site, scores_site, by = "sampleID")
+
+  # --- multivariate model ---
+  bf1 <- brms::bf(PC1 ~ treatment * diet * sex)
+  bf2 <- brms::bf(PC2 ~ treatment * diet * sex)
+
+  priors_mv <- c(
+    brms::prior(normal(0, 1), class = "b", resp = "PC1"),
+    brms::prior(normal(0, 1), class = "b", resp = "PC2"),
+    brms::prior(normal(0, 1), class = "Intercept", resp = "PC1"),
+    brms::prior(normal(0, 1), class = "Intercept", resp = "PC2"),
+    brms::prior(exponential(1), class = "sigma", resp = "PC1"),
+    brms::prior(exponential(1), class = "sigma", resp = "PC2"),
+    brms::prior(lkj(2), class = "rescor")
+  )
+
+  fit_site <- brms::brm(
+    bf1 + bf2 + brms::set_rescor(TRUE),
+    data = df_pcoa_site,
+    family = gaussian(),
+    prior = priors_mv,
+    chains = chains, iter = iter, warmup = warmup,
+    control = list(adapt_delta = 0.99, max_treedepth = 15),
+    backend = "cmdstanr",
+    seed = seed
+  )
+
+  list(
+    site   = site_name,
+    physeq = physeq_site,
+    meta   = meta_site,
+    bray   = bray_site,
+    df_pcoa = df_pcoa_site,
+    fit    = fit_site
+  )
+}
+
+
+res_ileum   <- run_site_pcoa_pipeline(physeq_ST_git, "ileum")
+res_colon   <- run_site_pcoa_pipeline(physeq_ST_git, "colon")
+res_stomach <- run_site_pcoa_pipeline(physeq_ST_git, "stomach")
+
+
+#plot
+forest_colon   <- make_site_beta_forest(res_colon$fit,   res_colon$df_pcoa)
+forest_ileum   <- make_site_beta_forest(res_ileum$fit,   res_ileum$df_pcoa)
+forest_stomach <- make_site_beta_forest(res_stomach$fit, res_stomach$df_pcoa)
+
+forest_colon$betaplot
+forest_ileum$betaplot
+forest_stomach$betaplot
+
+```
+
+```{r}
+make_pcoa_plot <- function(physeq, site_name) {
+
+  # extract metadata
+  meta <- as(phyloseq::sample_data(physeq), "data.frame")
+
+  # find samples for this site
+  keep_ids <- rownames(meta)[meta$sample_type == site_name]
+
+  # prune samples
+  physeq_site <- phyloseq::prune_samples(keep_ids, physeq)
+
+  # ordination
+  ord <- phyloseq::ordinate(physeq_site, method = "PCoA", distance = "bray")
+
+  # rename axes
+  colnames(ord$vectors)[1:2] <- c("PCoA1", "PCoA2")
+
+  # plot
+  p <- phyloseq::plot_ordination(
+    physeq_site, ord,
+    type = "samples",
+    color = "treatment"
+  ) +
+    facet_grid(sex ~ diet_new) +
+    geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) +
+    geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+    scale_color_manual(
+      values = c("Ctrl" = "#0072B2", "Hp" = "#E69F00"),
+      labels = c("Control", expression(italic("H. pylori")))
+    ) +
+    ggtitle(toupper(site_name)) +
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(size = 12),
+      axis.title.y = element_text(size = 12),
+      axis.title.x = element_text(size = 12),
+      axis.text.y = element_text(size = 12),
+      strip.text.x = element_text(size = 12),
+      strip.text.y = element_text(size = 12),
+      legend.position = "none",
+      legend.title = element_blank(),
+      legend.margin = margin(c(1, 5, 5, 5)),
+      legend.spacing = unit(0.5, "cm"),
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      strip.background = element_blank(),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.75),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.spacing.x = unit(1, "lines"),
+      panel.spacing.y = unit(1, "lines")
+    ) +
+    guides(color = guide_legend(override.aes = list(size = 5)))
+
+  return(p)
+}
+
+
+
+sites <- c("colon", "ileum", "stomach")
+
+plots <- lapply(sites, function(site) {
+  make_pcoa_plot(physeq_ST_git, site)
+})
+
+names(plots) <- sites
+
+plots$colon
+plots$ileum
+plots$stomach
+```
+
+
+
+```{r}
+library(patchwork)
+
+row1 <- (plots$stomach | forest_stomach$betaplot) +
+  plot_annotation(tag_levels = list(c("A", "B")))
+
+row2 <- (plots$ileum | forest_ileum$betaplot) +
+  plot_annotation(tag_levels = list(c("C", "D")))
+
+row3 <- (plots$colon | forest_colon$betaplot) +
+  plot_annotation(tag_levels = list(c("E", "F")))
+
+composite_fig <- (row1 / row2 / row3) +
+  plot_layout(guides = "collect") &
+  theme(
+    plot.tag = element_text(size = 16, face = "bold"),
+    legend.position = "bottom"
+  )
+
+composite_fig
+
+ggsave("beta_ST_GIT.jpeg", plot = composite_fig, device = "jpeg",  units="cm",  width=24, height=32, dpi=300)
+```
+
