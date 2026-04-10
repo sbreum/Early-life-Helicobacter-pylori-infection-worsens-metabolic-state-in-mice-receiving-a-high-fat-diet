@@ -21,6 +21,7 @@ library(tidybayes)
 library(stringr)
 library(brms)
 library(patchwork)
+library(cmdstanr)
 ```
 
 ```{r}
