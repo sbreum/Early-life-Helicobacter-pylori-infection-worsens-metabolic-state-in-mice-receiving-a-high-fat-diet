@@ -634,3 +634,128 @@ ggsave("MS1_bodyweight_final.jpeg", MS1_bodyweight_final, width = 9.8, height = 
 
 MS1_bodyweight_final
 ```
+
+
+```{r}
+#WAT weight LT experiment
+# --- 1. FILTER LT DATA ---
+filtered_wat_weights_LT <- weights %>%
+  filter(experiment == "LT", weeks_on_diet %in% c(20, 21)) %>%
+  filter(!is.na(wat_weight))
+
+df_LT_WAT <- filtered_wat_weights_LT %>%
+  mutate(
+    treatment = factor(treatment, levels = c("Ctrl", "Hp")),
+    sex       = factor(sex, levels = c("female", "male"))
+  )
+
+# --- 2. FIT MODEL ---
+fit_wat_LT <- brm(
+  wat_weight ~ treatment * sex,
+  data = df_LT_WAT,
+  family = student(),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(student_t(3, 0, 1), class = "sigma")
+  ),
+  chains = 4, iter = 4000, warmup = 2000,
+  control = list(adapt_delta = 0.99),
+  backend = "cmdstanr",
+  seed = 123
+)
+
+# --- 3. PREDICTIONS ---
+newdata_LT_WAT <- expand_grid(
+  sex       = unique(df_LT_WAT$sex),
+  treatment = unique(df_LT_WAT$treatment)
+)
+
+preds_LT_WAT <- add_epred_draws(
+  fit_wat_LT,
+  newdata = newdata_LT_WAT,
+  re_formula = NA
+)
+
+# --- 4. CALCULATE TREATMENT EFFECT AS % CHANGE ---
+# Formula: ((Hp / Ctrl) - 1) * 100
+
+eff_treat_LT_WAT <- preds_LT_WAT %>%
+  group_by(sex, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = treatment, values_from = epred) %>%
+  mutate(effect = (Hp / Ctrl - 1) * 100) %>%
+  group_by(sex) %>%
+  summarise(
+    median     = median(effect),
+    CI_low     = quantile(effect, 0.025),
+    CI_high    = quantile(effect, 0.975),
+    CI80_low   = quantile(effect, 0.10),
+    CI80_high  = quantile(effect, 0.90),
+    prob_pos   = mean(effect > 0),
+    prob_neg   = mean(effect < 0),
+    Pd         = pmax(mean(effect > 0), mean(effect < 0)),
+    .groups    = "drop"
+  ) %>%
+  mutate(
+    label = "Treatment"
+  )
+# --- 5. PLOT DATAFRAME ---
+plot_df_wat_LT <- eff_treat_LT_WAT %>%
+  mutate(
+    label = factor(label, levels = "Treatment")
+  )
+
+# --- 6. PLOT ---
+WAT_plot_LT <- ggplot(
+  plot_df_wat_LT,
+  aes(x = label, y = median, color = sex)
+) +
+  # 95% interval = thin outer line
+  geom_linerange(
+    aes(ymin = CI_low, ymax = CI_high),
+    position = position_dodge(width = 0.5),
+    linewidth = 0.6
+  ) +
+  # 80% interval = thicker inner line
+  geom_linerange(
+    aes(ymin = CI80_low, ymax = CI80_high),
+    position = position_dodge(width = 0.5),
+    linewidth = 1.8
+  ) +
+  # posterior median
+  geom_point(
+    position = position_dodge(width = 0.5),
+    size = 2.2
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  scale_color_manual(
+    values = c("female" = "#b19cd9", "male" = "#6a0dad")
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.text.y        = element_text(color = "black"),
+    legend.position    = "bottom",
+    legend.box         = "vertical",
+    legend.margin      = margin(t = 0, b = 0, unit = "pt"),
+    plot.margin        = margin(t = 10, r = 30, b = 10, l = 10, unit = "pt")
+  ) +
+  labs(
+    x = "",
+    y = "Effect Estimate (% change)",
+    color = "Sex"
+  )
+
+# Save
+ggsave(
+  "WAT_effects_percent_LT.jpeg",
+  plot = WAT_plot_LT,
+  width = 6.5,
+  height = 4.5,
+  units = "in"
+)
+
+WAT_plot_LT
+
+```
