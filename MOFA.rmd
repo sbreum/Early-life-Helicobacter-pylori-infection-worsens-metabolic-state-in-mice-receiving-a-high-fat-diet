@@ -14,6 +14,7 @@ library(purrr)
 library(speedyseq)
 library(cowplot)
 library(reticulate)
+library(cmdstanr)
 library(MOFA2)
 library(tidytext)
 
