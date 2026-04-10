@@ -1,0 +1,636 @@
+
+---
+title: "Weight"
+author: "Sigri"
+date: "2024-10-22"
+output: html_document
+---
+
+# Load libraries
+```{r load libraries}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(brms)
+library(tidybayes)
+library(cowplot)
+library(cmdstanr)
+```
+
+# Import data
+```{r import data}
+weights <- read_xlsx("MS1_weights.xlsx") %>%
+  mutate(sex = factor(sex, levels = c("female", "male"))) %>%
+  filter(!mouseID %in% (filter(., notes == "dead") %>% pull(mouseID))) %>% # remove mice that died during experiment
+  filter(age_weeks != 4) %>% # remove weights before date of diet change 
+  mutate(treatment_diet = paste(treatment, diet, sep = "_")) %>%
+  group_by(mouseID) %>%
+  mutate(initial_bodyweight = ifelse(experiment == "ST", body_weight[age_weeks == 6], body_weight[age_weeks == 5]),
+         rel_bodyweight_gain = ((body_weight - initial_bodyweight) / initial_bodyweight) * 100) %>%
+  ungroup() %>%
+  select(-initial_bodyweight)  # remove the temporary initial_bodyweight column
+```
+
+```{r add Hp loads}
+# Load Hp loads data
+MS1_Hp_loads <- read_xlsx("/MS1_Hp_loads.xlsx") %>%
+  select(mouseID, Hp_copies_std) 
+
+# Add Hp loads to dataframe
+weights <- weights %>% 
+  inner_join(MS1_Hp_loads, by = "mouseID")
+
+
+```
+
+
+
+```{r}
+###short-term exp, weight gain trajectories
+
+weights_ST <- weights %>% 
+  filter(experiment == "ST") %>%
+  mutate(
+    treatment = factor(treatment, levels = c("Ctrl", "Hp")),
+    sex       = factor(sex, levels = c("female", "male")),
+    diet      = factor(diet, levels = c("CD", "HFD")),
+    weeks_centered = weeks_on_diet - mean(weeks_on_diet, na.rm = TRUE),
+   mouseID = factor(mouseID)
+  )
+
+
+fit_wt_bayes <- brm(
+  body_weight ~ treatment * diet * sex * weeks_centered + 
+    (1 + weeks_centered | mouseID),
+  data = weights_ST,
+  family = student(),   # robust to outliers
+  prior = c(
+    prior(normal(0, 5), class = "b"),       # coefficients
+    prior(exponential(1), class = "sd"),    # random effects
+    prior(student_t(3, 0, 5), class = "sigma") # residual
+  ),
+  chains = 4, iter = 4000, warmup = 2000,
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  backend = "cmdstanr"
+)
+
+
+
+# Predict at mean timepoint (weeks_centered = 0)
+newdata_wt <- expand_grid(
+  weeks_centered = 0, 
+  treatment = unique(fit_wt_bayes$data$treatment),
+  diet      = unique(fit_wt_bayes$data$diet),
+  sex       = unique(fit_wt_bayes$data$sex)
+)
+
+preds_wt <- add_epred_draws(fit_wt_bayes, newdata = newdata_wt, re_formula = NA)
+
+# --- 3. CALCULATE EFFECTS ---
+
+# A. Main Effects (Pooled)
+main_eff_treat <- preds_wt %>%
+  group_by(sex, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = treatment, values_from = epred) %>%
+  mutate(effect = Hp - Ctrl) %>%
+  group_by(sex) %>%
+  summarise(
+    median    = median(effect),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Main Effects", label = "Treatment")
+
+main_eff_diet <- preds_wt %>%
+  group_by(sex, diet, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = diet, values_from = epred) %>%
+  mutate(effect = HFD - CD) %>%
+  group_by(sex) %>%
+  summarise(
+    median    = median(effect),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Main Effects", label = "Diet")
+
+# B. Interaction
+interaction_eff <- preds_wt %>%
+  group_by(sex, diet, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = c(treatment, diet), values_from = epred) %>%
+  mutate(effect = (Hp_HFD - Ctrl_HFD) - (Hp_CD - Ctrl_CD)) %>%
+  group_by(sex) %>%
+  summarise(
+    median    = median(effect),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Interaction", label = "Interaction")
+
+# C. Simple Effects
+simple_treat <- preds_wt %>%
+  group_by(sex, diet, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = treatment, values_from = epred) %>%
+  mutate(effect = Hp - Ctrl) %>%
+  group_by(sex, diet) %>%
+  summarise(
+    median    = median(effect),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Simple Effects", label = paste("Treatment in", diet))
+
+simple_diet <- preds_wt %>%
+  group_by(sex, treatment, diet, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = diet, values_from = epred) %>%
+  mutate(effect = HFD - CD) %>%
+  group_by(sex, treatment) %>%
+  summarise(
+    median    = median(effect),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    Pd        = pmax(mean(effect > 0), mean(effect < 0)),
+    .groups   = "drop"
+  ) %>%
+  mutate(
+    type  = "Simple Effects",
+    label = paste("Diet in", treatment)
+  )
+
+# --- 4. COMBINE AND FORMAT ---
+plot_df_final <- bind_rows(
+  main_eff_treat,
+  main_eff_diet,
+  interaction_eff,
+  simple_treat,
+  simple_diet
+) %>%
+  mutate(
+    biomarker = "Body Weight (Short Term)",
+    label = factor(label, levels = c(
+      "Diet in Hp", "Diet in Ctrl", 
+      "Treatment in HFD", "Treatment in CD", 
+      "Interaction",
+      "Diet", "Treatment"
+    )),
+    type = factor(type, levels = c("Main Effects", "Interaction", "Simple Effects"))
+  )
+
+# --- 5. PLOT ---
+ST_weights_plot <- ggplot(plot_df_final, aes(x = label, y = median, color = sex)) +
+
+  # 95% CI
+  geom_linerange(
+    aes(ymin = CI_low, ymax = CI_high),
+    position = position_dodge(width = 0.6),
+    linewidth = 0.6
+  ) +
+
+  # 80% CI
+  geom_linerange(
+    aes(ymin = CI80_low, ymax = CI80_high),
+    position = position_dodge(width = 0.6),
+    linewidth = 1.8
+  ) +
+
+  # Posterior median
+  geom_point(
+    aes(shape = type),
+    position = position_dodge(width = 0.6),
+    size = 2
+  ) +
+
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  facet_wrap(~ biomarker) +
+
+  scale_color_manual(values = c("female" = "#b19cd9", "male" = "#6a0dad")) +
+  scale_shape_manual(values = c(
+    "Main Effects"   = 16,
+    "Interaction"    = 18,
+    "Simple Effects" = 15
+  )) +
+
+  guides(
+    shape = guide_legend(order = 1),
+    color = guide_legend(order = 2)
+  ) +
+
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.text.y        = element_text(color = "black"),
+    strip.text         = element_text(face = "bold"),
+    legend.position    = "bottom",
+    legend.box         = "vertical",
+    legend.margin      = margin(t = 0, b = 0, unit = "pt")
+  ) +
+  labs(
+    x = "", 
+    y = "Effect Estimate (Weight Difference in g)", 
+    color = "Sex",
+    shape = "Effect Type"
+  )
+
+ST_weights_plot
+ggsave("BodyWeight_Effects.pdf", plot = ST_weights_plot, width = 6, height = 5)
+```
+
+
+```{r}
+# Summarize for plotting
+week_lookup <- weights_ST %>%
+  select(weeks_centered, weeks_on_diet) %>%
+  distinct() %>%
+  arrange(weeks_centered)
+
+newdata_wt <- expand_grid(
+  weeks_centered = sort(unique(weights_ST$weeks_centered)),
+  treatment = levels(weights_ST$treatment),
+  diet      = levels(weights_ST$diet),
+  sex       = levels(weights_ST$sex)
+)
+
+preds_wt <- add_epred_draws(
+  fit_wt_bayes,
+  newdata = newdata_wt,
+  re_formula = NA
+)
+
+preds_summary <- preds_wt %>%
+  group_by(weeks_centered, sex, treatment, diet) %>%
+  summarise(
+    median    = median(.epred),
+    CI_low    = quantile(.epred, 0.025),
+    CI_high   = quantile(.epred, 0.975),
+    CI80_low  = quantile(.epred, 0.10),
+    CI80_high = quantile(.epred, 0.90),
+    .groups = "drop"
+  ) %>%
+  left_join(week_lookup, by = "weeks_centered") %>%
+  mutate(
+    treatment_diet = paste(treatment, diet, sep = "_")
+  )
+
+ST_bodyweight_trajectories_bayes <- ggplot() +
+  geom_line(
+    data = weights_ST,
+    aes(
+      x = weeks_on_diet,
+      y = body_weight,
+      color = treatment_diet,
+      group = mouseID
+    ),
+    alpha = 0.3,
+    size = 0.5
+  ) +
+  geom_line(
+    data = preds_summary,
+    aes(
+      x = weeks_on_diet,
+      y = median,
+      color = treatment_diet,
+      linetype = treatment_diet,
+      group = interaction(sex, treatment_diet)
+    ),
+    size = 1
+  ) +
+  xlab("Time (weeks)") +
+  ylab("Body weight (g)") +
+  facet_wrap(~ sex) +
+  scale_colour_manual(
+    values = c(
+      "Ctrl_CD" = "#0072B2", "Ctrl_HFD" = "#0072B2",
+      "Hp_CD" = "#E69F00", "Hp_HFD" = "#E69F00"
+    ),
+    labels = c(
+      expression("Control + CD"), expression("Control + HFD"),
+      expression(italic("H. pylori") * " + CD"), expression(italic("H. pylori") * " + HFD")
+    )
+  ) +
+  scale_linetype_manual(
+    values = c(
+      "Ctrl_CD" = "dotted", "Ctrl_HFD" = "solid",
+      "Hp_CD" = "dotted", "Hp_HFD" = "solid"
+    ),
+    labels = c(
+      expression("Control + CD"), expression("Control + HFD"),
+      expression(italic("H. pylori") * " + CD"), expression(italic("H. pylori") * " + HFD")
+    )
+  ) +
+  scale_x_continuous(expand = c(0, 0)) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(size = 10),
+    axis.title.y = element_text(size = 12),
+    axis.title.x = element_text(size = 12),
+    axis.text.y = element_text(size = 10),
+    strip.text.x = element_text(size = 12, face = "bold"),
+    strip.background = element_rect(fill = "grey90", colour = "black"),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 10),
+    legend.key.height = unit(0.5, "cm"),
+    legend.key.width = unit(1, "cm"),
+    panel.border = element_rect(colour = "black", fill = NA, size = 0.75),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.spacing.x = unit(1, "lines")
+  ) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE))
+
+ST_bodyweight_trajectories_bayes
+```
+
+
+
+
+
+```{r}
+
+###Long-term experiment, weight gain
+
+weights_LT <- weights %>% 
+  filter(experiment == "LT") %>%
+  mutate(
+    treatment = factor(treatment, levels = c("Ctrl", "Hp")),
+    sex       = factor(sex, levels = c("female", "male")),
+    weeks_centered = weeks_on_diet - mean(weeks_on_diet, na.rm = TRUE),
+   mouseID = factor(mouseID)
+  )
+
+
+
+fit_wt_bayes_LT <- brm(
+  body_weight ~ treatment  * sex * weeks_centered + 
+    (1 + weeks_centered | mouseID),
+  data = weights_LT,
+  family = student(),   # robust to outliers
+  prior = c(
+    prior(normal(0, 5), class = "b"),       # coefficients
+    prior(exponential(1), class = "sd"),    # random effects
+    prior(student_t(3, 0, 5), class = "sigma") # residual
+  ),
+  chains = 4, iter = 4000, warmup = 2000,
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  backend = "cmdstanr"
+)
+
+
+
+# --- 1. Prediction Grid ---
+newdata_wt_LT <- tidyr::expand_grid(
+  weeks_centered = 0,
+  treatment = unique(fit_wt_bayes_LT$data$treatment),
+  sex       = unique(fit_wt_bayes_LT$data$sex)
+)
+
+# Generate Draws
+preds_wt_LT <- add_epred_draws(
+  object = fit_wt_bayes_LT,
+  newdata = newdata_wt_LT,
+  re_formula = NA 
+)
+
+# --- 2. GLOBAL MAIN EFFECTS ---
+
+# Main Effect: Treatment (Averaged over Sex)
+eff_treat_LT <- preds_wt_LT %>%
+  group_by(sex, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = treatment, values_from = epred) %>%
+  mutate(effect = Hp - Ctrl) %>%
+  group_by(sex) %>%
+  summarise(
+    median    = median(effect),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    label = "Treatment"
+  )
+
+plot_df_LT <- eff_treat_LT %>%
+  mutate(
+    biomarker = "Body Weight (Long Term)",
+    label = factor(label, levels = c("Treatment"))
+  )
+
+# --- 4. PLOT ---
+plot_df_LT_clean <- plot_df_LT %>%
+  filter(sex %in% c("male", "female")) %>%
+  filter(!label %in% c("Sex", "Interaction", "sex", "interaction"))
+
+# 1. Create header
+plot_df_LT_clean$panel_title <- "Body Weight (Long Term)" 
+
+# 2. Create the Plot
+LT_weights_forestplot <- ggplot(
+  eff_treat_LT,
+  aes(x = label, y = median, color = sex)
+) +
+
+  # 95% CI (thin)
+  geom_linerange(
+    aes(ymin = CI_low, ymax = CI_high),
+    position = position_dodge(width = 0.5),
+    linewidth = 0.6
+  ) +
+
+  # 80% CI (thick)
+  geom_linerange(
+    aes(ymin = CI80_low, ymax = CI80_high),
+    position = position_dodge(width = 0.5),
+    linewidth = 1.8
+  ) +
+
+  # median
+  geom_point(
+    position = position_dodge(width = 0.5),
+    size = 2
+  ) +
+
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+
+  facet_wrap(~ "Body Weight (Long Term)") +
+
+  scale_color_manual(
+    values = c("female" = "#b19cd9", "male" = "#6a0dad")
+  ) +
+
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.text.y        = element_text(color = "black"),
+    strip.text         = element_text(face = "bold"),
+    legend.position    = "bottom"
+  ) +
+
+  labs(
+    x = "",
+    y = "Effect Estimate (Weight Difference in g)",
+    color = "Sex"
+  )
+
+LT_weights_forestplot
+
+```
+
+
+
+```{r}
+# Summarize posterior predictions for LT experiment (no diet)
+# Correct newdata generation for LT (weeks 0–20)
+
+newdata_wt_LT <- tidyr::expand_grid(
+  weeks_centered = sort(unique(weights_LT$weeks_centered)),
+  treatment = levels(weights_LT$treatment),
+  sex       = levels(weights_LT$sex)
+)
+
+preds_wt_LT <- add_epred_draws(
+  object = fit_wt_bayes_LT,
+  newdata = newdata_wt_LT,
+  re_formula = NA
+)
+
+# map centered weeks back to original week scale
+week_lookup_LT <- weights_LT %>%
+  select(weeks_centered, weeks_on_diet) %>%
+  distinct()
+
+preds_summary_LT <- preds_wt_LT %>%
+  group_by(weeks_centered, sex, treatment) %>%
+  summarise(
+    median    = median(.epred),
+    CI_low    = quantile(.epred, 0.025),
+    CI_high   = quantile(.epred, 0.975),
+    CI80_low  = quantile(.epred, 0.10),
+    CI80_high = quantile(.epred, 0.90),
+    .groups = "drop"
+  ) %>%
+  left_join(week_lookup_LT, by = "weeks_centered")
+
+
+
+LT_bodyweight_trajectories_bayes <- ggplot() +
+  geom_line(
+    data = weights_LT,
+    aes(
+      x = weeks_on_diet,
+      y = body_weight,
+      color = treatment,
+      group = mouseID
+    ),
+    alpha = 0.3,
+    size = 0.5
+  ) +
+  geom_line(
+    data = preds_summary_LT,
+    aes(
+      x = weeks_on_diet,
+      y = median,
+      color = treatment,
+      group = treatment
+    ),
+    size = 1
+  ) +
+  xlab("Time (weeks)") +
+  ylab("Body weight (g)") +
+  facet_wrap(~ sex, nrow = 1, strip.position = "top") +
+  scale_colour_manual(
+    values = c("Ctrl" = "#0072B2", "Hp" = "#E69F00"),
+    labels = c(
+      expression("Control + HFD"),
+      expression(italic("H. pylori") * " + HFD")
+    )
+  ) +
+  scale_x_continuous(expand = c(0, 0)) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(size = 10),
+    axis.title.y = element_text(size = 12),
+    axis.title.x = element_text(size = 12),
+    axis.text.y = element_text(size = 10),
+    strip.text.x = element_text(size = 12, face = "bold"),
+    strip.background = element_rect(fill = "grey90", colour = "black"),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 10),
+    legend.key.height = unit(0.5, "cm"),
+    legend.key.width = unit(1, "cm"),
+    panel.border = element_rect(colour = "black", fill = NA, size = 0.75),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.spacing.x = unit(1, "lines")
+  ) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE))
+
+LT_bodyweight_trajectories_bayes
+
+```
+
+
+
+# Make final figure 
+```{r combined weights plot}
+# Arrange the relative bodyweight gain plots
+
+
+# Extract legends
+legend_AB <- get_legend(ST_bodyweight_trajectories_bayes + theme(legend.position = "bottom"))
+legend_CD <- get_legend(ST_weights_plot + theme(legend.position = "right"))
+
+# Remove legends from plots
+A <- ST_bodyweight_trajectories_bayes + theme(legend.position = "none")
+B <- LT_bodyweight_trajectories_bayes + theme(legend.position = "none")
+C <- ST_weights_plot + theme(legend.position = "none")
+D <- LT_weights_forestplot + theme(legend.position = "none")
+
+# Reduce heights of each plot relative to width
+AB <- plot_grid(A, B, ncol = 2, labels = c("A", "B"), rel_widths = c(1, 1), align = "v")
+AB_with_legend <- plot_grid(AB, legend_AB, ncol = 1, rel_heights = c(1, 0.12)) 
+
+CD <- plot_grid(C, D, ncol = 2, labels = c("C", "D"), rel_widths = c(1, 1), align = "v")
+CD_with_legend <- plot_grid(CD, legend_CD, ncol = 2, rel_widths = c(1, 0.15)) 
+
+# Add a small spacer between AB and CD
+spacer <- plot_grid(NULL, NULL, ncol = 1, rel_heights = c(0.05))
+
+# Combine top (AB) and bottom (CD) panels
+MS1_bodyweight_final <- plot_grid(
+  AB_with_legend, spacer, CD_with_legend,
+  ncol = 1,
+  rel_heights = c(1, 0.05, 0.9), # leave space for top legend
+  align = "v"
+)
+
+# Save jpeg
+ggsave("MS1_bodyweight_final.jpeg", MS1_bodyweight_final, width = 9.8, height = 7)
+
+MS1_bodyweight_final
+```
