@@ -1,0 +1,723 @@
+```{r}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(phyloseq)
+library(tidybayes)
+library(brms)
+library(compositions)
+library(readxl)
+library(cmdstanr)
+library(stringr)
+library(ggplot2)
+library(purrr)
+library(speedyseq)
+library(cowplot)
+library(reticulate)
+library(MOFA2)
+library(tidytext)
+
+use_virtualenv("mofa_env", required = TRUE)
+```
+
+
+
+```{r}
+#prepare input for views
+
+MSD_df <- readxl::read_xlsx("MS1_MSD.xlsx", guess_max = 10000) %>%
+  #filter(biomarker != "C-peptide") %>%
+  mutate(biomarker = str_replace_all(biomarker, c("TNF-α" = "TNFa", "MCP-1" = "MCP1", "IL-6" = "IL6", "IL-10" = "IL10", "GLP-1" = "GLP1")))
+
+# Load Hp loads data
+MS1_Hp_loads <- read_xlsx("MS1_Hp_loads.xlsx") %>%
+  select(mouseID, experiment, total_bact_load, avg_copies, total_Hp_abund, total_DNA_conc, Hp_copies_std) 
+
+# subset Hp loads data by experiment
+MS1_Hp_loads_ST <- MS1_Hp_loads %>% 
+  filter(experiment == "ST") %>%
+  select(-experiment)
+
+# Add Hp loads to MSD dataframe 
+MSD_df <- MSD_df %>% 
+  inner_join(MS1_Hp_loads_ST, by = "mouseID") 
+
+MSD_df <- MSD_df %>% mutate(Hp_load = ifelse(Hp_copies_std > 1000, "high", "low"))
+
+# Remove Hp mice with low bacterial load
+MSD_df <- MSD_df %>%
+  mutate(Hp_load = ifelse(is.na(Hp_load) & treatment == "Ctrl", "Ctrl", Hp_load)) #%>%
+  #filter(Hp_load != "low") 
+
+
+#correct WAT weight
+MSD_df <- MSD_df %>%
+  mutate(new_wat_weight = ifelse(sex == "female" & mouseID != "EO5.1_FR", wat_weight / 2, wat_weight)) # only one WAT depot was collected from EO5.1_FR
+
+# Count missing values by biomarker and sex
+missing_counts <- MSD_df %>%
+  group_by(treatment, sex) %>%
+  summarise(
+    total_missing = sum(is.na(conc_undiluted)),
+    IL6_missing = sum(is.na(conc_undiluted) & biomarker == "IL6"),
+    Ghrelin_missing = sum(is.na(conc_undiluted) & biomarker == "Ghrelin"),
+    leptin_missing = sum(is.na(conc_undiluted) & biomarker == "leptin"),
+    Insulin_missing = sum(is.na(conc_undiluted) & biomarker == "Insulin"),
+    IL10_missing = sum(is.na(conc_undiluted) & biomarker == "IL10"),
+    MCP1_missing = sum(is.na(conc_undiluted) & biomarker == "MCP1"),
+    TNF_alpha_missing = sum(is.na(conc_undiluted) & biomarker == "TNFa"),
+    GLP1_missing = sum(is.na(conc_undiluted) & biomarker == "GLP1"),
+    PYY_missing = sum(is.na(conc_undiluted) & biomarker == "PYY"), 
+    Cpeptide_missing = sum(is.na(conc_undiluted) & biomarker == "Cpeptide")
+  )
+
+# View the missing counts
+print(missing_counts)
+
+
+#Readings with a value of 0 are replaced with the lowest recorded value for biomarker as detection limit
+assay_min_df <- tribble(
+  ~biomarker, ~min_conc,
+  "Ghrelin",   102.5391,
+  "GLP1",     8.710938,
+  "IL10",     32.22656,
+  "IL6",      25.5127,
+  "Insulin",   65.72266,
+  "Leptin",    121.582,
+  "MCP1",     22.26563,
+  "PYY",       40.03906,
+  "TNFa",     8.276367
+)
+
+MSD_noNAs_df <- MSD_df %>%
+  left_join(assay_min_df, by = c("biomarker")) %>%
+  mutate(
+    conc_noNA = if_else(is.na(conc_undiluted), min_conc, conc_undiluted),
+    conc_log10 = log10(conc_noNA),
+    Hp_copies_std_log10 = log10(Hp_copies_std)
+  )
+
+MSD_noNAs_df_b4 <- MSD_noNAs_df %>%
+  filter(timepoint == "b4")
+
+df_b4 <- MSD_noNAs_df_b4 %>% 
+  mutate(
+    treatment = factor(treatment, levels = c("Ctrl", "Hp")),
+    sex       = factor(sex, levels = c("female", "male")),
+    biomarker = factor(biomarker),
+    diet = factor(diet)
+  )
+
+
+physeq_ST_comp <- readRDS("ST_physeq_trans_pruned_0.001.rds") %>%
+  phyloseq::subset_samples(!is.na(treatment)) %>%
+  speedyseq::mutate_tax_table(
+    Phylum = dplyr::case_when(
+      Phylum == "Firmicutes" ~ "Bacillota",
+      Phylum == "Proteobacteria" ~ "Pseudomonadota",
+      Phylum == "Actinobacteria" ~ "Actinomycetota",
+      TRUE ~ Phylum
+    )
+  )
+physeq_ST_comp <- physeq_ST_comp  %>% mutate_sample_data(seqSampleID = sample_names(physeq_ST_comp))
+
+
+priors <- c(
+  prior(normal(0, 0.5), class = "b"),
+  prior(exponential(1), class = "sd"),
+  prior(student_t(3, 0, 1), class = "sigma")
+)
+
+clr_phyloseq <- function(ps, tax_level = "Family") {
+  ps_glom <- tax_glom(ps, taxrank = tax_level)
+
+  otu <- as(otu_table(ps_glom), "matrix")
+  if (!taxa_are_rows(ps_glom)) {
+    otu <- t(otu)
+  }
+
+  min_nonzero <- min(otu[otu > 0])
+  otu_pc <- otu + min_nonzero / 2
+  otu_pc <- sweep(otu_pc, 2, colSums(otu_pc), "/")
+  otu_clr <- apply(otu_pc, 2, compositions::clr)
+
+  phyloseq(
+    otu_table(otu_clr, taxa_are_rows = TRUE),
+    tax_table(ps_glom),
+    sample_data(ps_glom)
+  )
+}
+
+ps_ST_GIT_clr_to_long <- function(ps_clr, tax_level = "Family") {
+  psmelt(ps_clr) %>%
+    rename(CLR = Abundance) %>%
+    mutate(
+      sex = factor(sex),
+      treatment = factor(treatment),
+      diet = factor(diet),
+      !!tax_level := factor(.data[[tax_level]])
+    )
+}
+
+physeq_ST_comp_git <- physeq_ST_comp %>%
+  phyloseq::subset_samples(timepoint == "t4") %>%
+  speedyseq::mutate_tax_table(
+    Family = dplyr::case_when(
+      Family == "[Eubacterium] coprostanoligenes group" ~ "Eub. coprostanoligenes gr.",
+      TRUE ~ Family
+    )
+  )                                   
+
+run_microbiome_model <- function(df, tax_level = "Family") {
+  
+  form <- as.formula(
+    paste0(
+      "CLR ~ sex * treatment * diet + ",
+      "(1 + sex * treatment * diet || ", tax_level, ")"
+    )
+  )
+  
+  model <- brm(
+    formula = form,
+    data = df,
+    family = student(),
+    prior = priors,
+    chains = 4,
+    iter = 4000,
+    warmup = 2000,
+    backend = "cmdstanr",
+    control = list(adapt_delta = 0.99, max_treedepth = 15)
+  )
+  
+  return(model)
+}
+
+
+sites <- c("colon")
+
+models_site <- list()
+dfs_site <- list()
+ps_clr_site <- list()
+
+for (site in sites) {
+  cat("Running site:", site, "\n")
+
+  ps_site <- phyloseq::subset_samples(physeq_ST_comp_git, sample_type == site)
+
+  ps_clr <- clr_phyloseq(ps_site, tax_level = "Family")
+  df_site <- ps_ST_GIT_clr_to_long(ps_clr, tax_level = "Family")
+
+  model <- run_microbiome_model(df_site, tax_level = "Family")
+
+  ps_clr_site[[site]] <- ps_clr
+  dfs_site[[site]] <- df_site
+  models_site[[site]] <- model
+}
+
+
+```
+
+
+
+```{r}
+#prepare the views
+# ----------------------------
+# Metadata / continuous covariates
+# ----------------------------
+meta_inf <- df_b4 %>%
+  filter(treatment == "Hp") %>%
+  distinct(mouseID, sex, diet, treatment, new_wat_weight, Hp_copies_std_log10) %>%
+  mutate(
+    sex = factor(sex, levels = c("female", "male")),
+    diet = factor(diet, levels = c("CD", "HFD")),
+    WAT_z = as.numeric(scale(new_wat_weight)),
+    Hp_z  = as.numeric(scale(Hp_copies_std_log10))
+  )
+
+# ----------------------------
+# Biomarker view
+# ----------------------------
+biomarker_view <- df_b4 %>%
+  filter(treatment == "Hp") %>%
+  select(mouseID, biomarker, conc_log10) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = biomarker,
+    values_from = conc_log10
+  )
+
+biomarker_view_std <- biomarker_view %>%
+  mutate(
+    across(-mouseID, ~ as.numeric(scale(.x)))
+  )
+
+# ----------------------------
+# WAT view
+# ----------------------------
+wat_view <- meta_inf %>%
+  select(mouseID, WAT_z)
+
+# ----------------------------
+# Hp view
+# ----------------------------
+hp_view <- meta_inf %>%
+  select(mouseID, Hp_z)
+
+# ----------------------------
+# Microbiome colon view
+# ----------------------------
+families_keep <- c(
+  "Akkermansiaceae",
+  "Lachnospiraceae",
+  "Prevotellaceae",
+  "Marinifilaceae",
+  "Lactobacillaceae",
+  "Clostridiaceae",
+  "Tannerellaceae",
+  "Eub. coprostanoligenes gr.",
+  "Bacteroidaceae",
+  "Streptococcaceae"
+)
+
+microbiome_view_colon <- dfs_site$colon %>%
+  filter(
+    treatment == "Hp",
+    Family %in% families_keep
+  ) %>%
+  select(mouseID, Family, CLR) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = Family,
+    values_from = CLR
+  )
+
+microbiome_view_colon_std <- microbiome_view_colon %>%
+  mutate(
+    across(-mouseID, ~ as.numeric(scale(.x)))
+  )
+
+
+common_ids <- Reduce(
+  intersect,
+  list(
+    meta_inf$mouseID,
+    biomarker_view_std$mouseID,
+    wat_view$mouseID,
+    hp_view$mouseID,
+    microbiome_view_colon_std$mouseID
+  )
+)
+
+common_ids
+length(common_ids)
+
+
+meta_inf_mofa <- meta_inf %>%
+  filter(mouseID %in% common_ids) %>%
+  arrange(mouseID)
+
+biomarker_view_std <- biomarker_view_std %>%
+  filter(mouseID %in% common_ids) %>%
+  arrange(mouseID)
+
+wat_view <- wat_view %>%
+  filter(mouseID %in% common_ids) %>%
+  arrange(mouseID)
+
+hp_view <- hp_view %>%
+  filter(mouseID %in% common_ids) %>%
+  arrange(mouseID)
+
+microbiome_view_colon_std <- microbiome_view_colon_std %>%
+  filter(mouseID %in% common_ids) %>%
+  arrange(mouseID)
+
+
+all(meta_inf_mofa$mouseID == biomarker_view_std$mouseID)
+all(meta_inf_mofa$mouseID == wat_view$mouseID)
+all(meta_inf_mofa$mouseID == hp_view$mouseID)
+all(meta_inf_mofa$mouseID == microbiome_view_colon_std$mouseID)
+
+microbiome_mat_colon <- microbiome_view_colon_std %>%
+  column_to_rownames("mouseID") %>%
+  t()
+
+biomarker_mat <- biomarker_view_std %>%
+  column_to_rownames("mouseID") %>%
+  t()
+
+wat_mat <- wat_view %>%
+  column_to_rownames("mouseID") %>%
+  t()
+
+hp_mat <- hp_view %>%
+  column_to_rownames("mouseID") %>%
+  t()
+
+microbiome_mat_colon <- microbiome_view_colon_std %>%
+  column_to_rownames("mouseID") %>%
+  t()
+
+biomarker_mat <- biomarker_view_std %>%
+  column_to_rownames("mouseID") %>%
+  t()
+
+wat_mat <- wat_view %>%
+  column_to_rownames("mouseID") %>%
+  t()
+
+hp_mat <- hp_view %>%
+  column_to_rownames("mouseID") %>%
+  t()
+
+
+drop_zero_var <- function(mat) {
+  mat[apply(mat, 1, function(x) sd(x, na.rm = TRUE) > 0), , drop = FALSE]
+}
+
+microbiome_mat_colon <- drop_zero_var(microbiome_mat_colon)
+biomarker_mat <- drop_zero_var(biomarker_mat)
+wat_mat <- drop_zero_var(wat_mat)
+hp_mat <- drop_zero_var(hp_mat)
+
+
+data_list <- list(
+  microbiome_family_clr = microbiome_mat_colon,
+  biomarkers_log10      = biomarker_mat,
+  adiposity             = wat_mat,
+  hp_burden             = hp_mat
+)
+
+sample_metadata <- meta_inf_mofa %>%
+  select(mouseID, sex, diet, treatment, new_wat_weight, Hp_copies_std_log10, WAT_z, Hp_z)
+
+mofa_input <- list(
+  data_list = data_list,
+  sample_metadata = sample_metadata
+)
+
+saveRDS(mofa_input, file = "mofa_input_colon.rds")
+saveRDS(microbiome_mat_colon, "microbiome_mat.rds")
+saveRDS(biomarker_mat, "biomarker_mat.rds")
+saveRDS(wat_mat, "wat_mat.rds")
+saveRDS(hp_mat, "hp_mat.rds")
+
+```
+
+
+```{r}
+
+
+# -------------------------------------------------
+# 1) Check the input structure
+# -------------------------------------------------
+# Each view should be a matrix:
+# rows    = features
+# columns = samples
+
+lapply(data_list, dim)
+
+# Sample names should match across all views
+stopifnot(
+  all(colnames(data_list$microbiome_family_clr) == colnames(data_list$biomarkers_log10)),
+  all(colnames(data_list$microbiome_family_clr) == colnames(data_list$adiposity)),
+  all(colnames(data_list$microbiome_family_clr) == colnames(data_list$hp_burden))
+)
+
+# Optional: inspect sample names
+head(colnames(data_list$microbiome_family_clr))
+
+# -------------------------------------------------
+# 2) Create MOFA object
+# -------------------------------------------------
+mofa_obj <- create_mofa(data_list)
+
+# Optional
+plot_data_overview(mofa_obj)
+
+# -------------------------------------------------
+# 3) Data options
+# -------------------------------------------------
+data_opts <- get_default_data_options(mofa_obj)
+
+# Since you've already transformed / standardized the data,
+# keep extra scaling off unless you explicitly want MOFA to rescale views.
+data_opts$scale_views  <- FALSE
+data_opts$scale_groups <- FALSE
+data_opts$center_groups <- TRUE
+
+# -------------------------------------------------
+# 4) Model options
+# -------------------------------------------------
+model_opts <- get_default_model_options(mofa_obj)
+
+# Start modestly with factor number because sample size is limited
+model_opts$num_factors <- 5
+
+# All your views are continuous/transformed, so gaussian is appropriate
+model_opts$likelihoods <- c(
+  microbiome_family_clr = "gaussian",
+  biomarkers_log10      = "gaussian",
+  adiposity             = "gaussian",
+  hp_burden             = "gaussian"
+)
+
+# Reasonable defaults for sparse multi-view data
+model_opts$spikeslab_weights <- TRUE
+model_opts$spikeslab_factors <- FALSE
+model_opts$ard_weights <- TRUE
+model_opts$ard_factors <- FALSE
+
+# -------------------------------------------------
+# 5) Training options
+# -------------------------------------------------
+train_opts <- get_default_training_options(mofa_obj)
+
+# For exploratory analysis
+train_opts$maxiter <- 1000
+train_opts$convergence_mode <- "medium"
+train_opts$verbose <- TRUE
+
+# Optional: keep all factors initially
+train_opts$drop_factor_threshold <- -1
+
+# -------------------------------------------------
+# 6) Prepare MOFA object
+# -------------------------------------------------
+mofa_obj <- prepare_mofa(
+  object = mofa_obj,
+  data_options = data_opts,
+  model_options = model_opts,
+  training_options = train_opts
+)
+
+# -------------------------------------------------
+# 7) Train model
+# -------------------------------------------------
+outfile <- "mofa_colon_biomarker_hp_wat_model.hdf5"
+
+mofa_trained <- run_mofa(
+  object = mofa_obj,
+  outfile = outfile,
+  use_basilisk = FALSE
+)
+
+# -------------------------------------------------
+# 8) Save R object too
+# -------------------------------------------------
+saveRDS(mofa_trained, file = "mofa_colon_biomarker_hp_wat_model.rds")
+```
+
+
+```{r}
+
+  
+mofa_trained <- readRDS("mofa_colon_biomarker_hp_wat_model.rds")
+
+samples_metadata(mofa_trained) <- sample_metadata %>%
+  rename(sample = mouseID)
+```
+
+```{r}
+plot_variance_explained(mofa_trained, x = "view", y = "factor")
+plot_variance_explained(mofa_trained, x = "factor", y = "view")
+```
+
+```{r}
+factors <- get_factors(mofa_trained, factors = "all")[[1]]
+factor_df <- as.data.frame(factors)
+factor_df$mouseID <- rownames(factors)
+
+factor_df <- factor_df %>%
+  left_join(sample_metadata, by = "mouseID")
+```
+
+
+
+```{r}
+# Microbiome
+micro_w <- get_weights(
+  mofa_trained,
+  views = "microbiome_family_clr",
+  factors = "Factor1"
+)[[1]] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("feature") %>%
+  rename(weight = Factor1) %>%
+  mutate(view = "Microbiome")
+
+# Biomarkers
+bio_w <- get_weights(
+  mofa_trained,
+  views = "biomarkers_log10",
+  factors = "Factor1"
+)[[1]] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("feature") %>%
+  rename(weight = Factor1) %>%
+  mutate(view = "Biomarker")
+
+loadings_df <- bind_rows(micro_w, bio_w)
+
+
+
+top_loadings <- loadings_df %>%
+  group_by(view) %>%
+  slice_max(order_by = abs(weight), n = 9) %>%
+  ungroup() %>%
+  mutate(
+    direction = ifelse(weight > 0, "Positive", "Negative"),
+    feature = reorder_within(feature, weight, view)
+  )
+
+panelD <- ggplot(top_loadings, aes(x = feature, y = weight, fill = direction)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~view, scales = "free_y") +
+  scale_x_reordered() +
+  scale_fill_manual(values = c(
+    "Positive" = "#D55E00",
+    "Negative" = "#0072B2"
+  )) +
+  theme_bw() +
+  theme(
+    strip.text = element_text(face = "bold"),
+    axis.text.y = element_text(color = "black")
+  ) +
+  labs(
+    x = "",
+    y = "Factor1 loading",
+    fill = ""
+  )
+```
+
+
+
+
+```{r}
+micro_w <- get_weights(
+  mofa_trained,
+  views = "microbiome_family_clr",
+  factors = "all"
+)[[1]] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Family")
+
+micro_w_long <- micro_w %>%
+  tidyr::pivot_longer(
+    cols = starts_with("Factor"),
+    names_to = "Factor",
+    values_to = "Weight"
+  )
+
+micro_w_long <- micro_w_long %>%
+  mutate(
+    direction = ifelse(Weight > 0, "Positive", "Negative")
+  )
+```
+
+
+
+```{r}
+bio_w <- get_weights(mofa_trained, views = "biomarkers_log10", factors = "all")[[1]]
+bio_w <- as.data.frame(bio_w)
+bio_w$Biomarker <- rownames(bio_w)
+
+bio_w %>%
+  arrange(desc(abs(Factor1))) %>%
+  head(10)
+
+
+bio_w_long <- bio_w %>%
+  tidyr::pivot_longer(
+    cols = starts_with("Factor"),
+    names_to = "Factor",
+    values_to = "Weight"
+  )
+
+bio_w_long %>%
+  group_by(Factor) %>%
+  slice_max(order_by = abs(Weight), n = 10) %>%
+  arrange(Factor, desc(abs(Weight)))
+```
+```{r}
+get_weights(mofa_trained, views = "adiposity", factors = "all")[[1]]
+get_weights(mofa_trained, views = "hp_burden", factors = "all")[[1]]
+```
+
+
+```{r}
+micro_top <- micro_w_long %>%
+  group_by(Factor) %>%
+  slice_max(order_by = abs(Weight), n = 5) %>%
+  mutate(view = "Microbiome", feature = Family) %>%
+  select(Factor, view, feature, Weight)
+
+bio_top <- bio_w_long %>%
+  group_by(Factor) %>%
+  slice_max(order_by = abs(Weight), n = 5) %>%
+  mutate(view = "Biomarker", feature = Biomarker) %>%
+  select(Factor, view, feature, Weight)
+
+bind_rows(micro_top, bio_top) %>%
+  arrange(Factor, desc(abs(Weight)))
+```
+
+
+
+
+```{r}
+ggplot(factor_df, aes(x = diet, y = Factor1, color = sex)) +
+  geom_point(size = 2, position = position_jitter(width = 0.05)) +
+  theme_bw()
+
+ggplot(factor_df, aes(x = sex, y = Factor1, color = diet)) +
+  geom_point(size = 2, position = position_jitter(width = 0.05)) +
+  theme_bw()
+
+panelA <- ggplot(factor_df, aes(x = Hp_z, y = Factor1, color = diet)) +
+  geom_point(size = 2) +
+  geom_smooth(method = "lm", se = FALSE) +
+  theme_bw()
+
+panelB <- ggplot(factor_df, aes(x = WAT_z, y = Factor1)) +
+  geom_point(size = 2, color = "#4D4D4D") +
+  geom_smooth(method = "lm", se = FALSE, color = "#0072B2") +
+  theme_bw()
+
+panelC <- ggplot(factor_df, aes(x = diet, y = Factor1, fill = diet)) +
+  geom_boxplot(alpha = 0.4, outlier.shape = NA) +
+  geom_jitter(width = 0.08, size = 2) +
+  theme_bw()
+
+
+
+```
+
+
+
+```{r}
+
+MOFA_final_figure <- plot_grid(
+  panelA, panelB,
+  panelC, panelD,
+  ncol = 2,
+  labels = c("A", "B", "C", "D"),
+  align = "hv",
+  axis = "tblr",
+  rel_widths = c(1, 1),
+  rel_heights = c(1, 1.1)
+)
+
+MOFA_final_figure
+
+
+
+ggsave(
+  "MOFA_colon_integrated_figure.png",
+  MOFA_final_figure,
+  width = 10,
+  height = 8,
+  dpi = 300
+)
+```
