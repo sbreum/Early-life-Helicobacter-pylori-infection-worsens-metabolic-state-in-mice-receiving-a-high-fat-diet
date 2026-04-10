@@ -6,29 +6,16 @@
 library(ggplot2)
 library(phyloseq)
 library(readxl)
-library(vegan)
 library(ggpubr)
-library(tidyverse)
-library(EnvStats)
-library(rstatix)
-library(ggbeeswarm)
-library(effects)
-library(modelsummary)
 library(speedyseq)
-library(MicEco)
 library(ggh4x)
-library(sjPlot)
-library(permute)
 library(dplyr)
 library(tidyr)
 library(stringr)
-library(dplyr)
-library(tidyr)
 library(tidybayes)
 library(forcats)
-library(ggplot2)
-
-
+library(brms)
+library(patchwork)
 ```
 
 # Load phyloseq objects
