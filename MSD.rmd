@@ -1,0 +1,1703 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-12-02"
+---
+
+# Load libraries
+```{r load libraries}
+
+library(readxl)
+library(ggpubr)
+library(brms)
+library(tidybayes)
+library(cmdstanr)
+library(stringr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+library(cowplot)
+library(loo)
+```
+
+# Import data
+```{r}
+MSD_df <- readxl::read_xlsx("MS1_MSD.xlsx", guess_max = 10000) %>%
+  #filter(biomarker != "C-peptide") %>%
+  mutate(biomarker = str_replace_all(biomarker, c("TNF-α" = "TNFa", "MCP-1" = "MCP1", "IL-6" = "IL6", "IL-10" = "IL10", "GLP-1" = "GLP1")))
+
+```
+
+```{r add Hp loads}
+# Load Hp loads data
+MS1_Hp_loads <- read_xlsx("MS1_Hp_loads.xlsx") %>%
+  select(mouseID, experiment, total_bact_load, avg_copies, total_Hp_abund, total_DNA_conc, Hp_copies_std) 
+
+# subset Hp loads data by experiment
+MS1_Hp_loads_ST <- MS1_Hp_loads %>% 
+  filter(experiment == "ST") %>%
+  select(-experiment)
+
+# Add Hp loads to MSD dataframe 
+MSD_df <- MSD_df %>% 
+  inner_join(MS1_Hp_loads_ST, by = "mouseID") 
+
+MSD_df <- MSD_df %>% mutate(Hp_load = ifelse(Hp_copies_std > 1000, "high", "low"))
+
+
+MSD_df <- MSD_df %>%
+  mutate(Hp_load = ifelse(is.na(Hp_load) & treatment == "Ctrl", "Ctrl", Hp_load)) 
+
+
+#correct WAT weight
+MSD_df <- MSD_df %>%
+  mutate(new_wat_weight = ifelse(sex == "female" & mouseID != "EO5.1_FR", wat_weight / 2, wat_weight)) # only one WAT depot was collected from EO5.1_FR
+
+
+```
+
+```{r}
+# Count missing values by biomarker and sex
+missing_counts <- MSD_df %>%
+  group_by(treatment, sex) %>%
+  summarise(
+    total_missing = sum(is.na(conc_undiluted)),
+    IL6_missing = sum(is.na(conc_undiluted) & biomarker == "IL6"),
+    Ghrelin_missing = sum(is.na(conc_undiluted) & biomarker == "Ghrelin"),
+    leptin_missing = sum(is.na(conc_undiluted) & biomarker == "leptin"),
+    Insulin_missing = sum(is.na(conc_undiluted) & biomarker == "Insulin"),
+    IL10_missing = sum(is.na(conc_undiluted) & biomarker == "IL10"),
+    MCP1_missing = sum(is.na(conc_undiluted) & biomarker == "MCP1"),
+    TNF_alpha_missing = sum(is.na(conc_undiluted) & biomarker == "TNFa"),
+    GLP1_missing = sum(is.na(conc_undiluted) & biomarker == "GLP1"),
+    PYY_missing = sum(is.na(conc_undiluted) & biomarker == "PYY"), 
+    Cpeptide_missing = sum(is.na(conc_undiluted) & biomarker == "Cpeptide")
+  )
+
+# View the missing counts
+print(missing_counts)
+
+
+#Readings with a value of 0 are replaced with the lowest recorded value for biomarker as detection limit
+assay_min_df <- tribble(
+  ~biomarker, ~min_conc,
+  "Ghrelin",   102.5391,
+  "GLP1",     8.710938,
+  "IL10",     32.22656,
+  "IL6",      25.5127,
+  "Insulin",   65.72266,
+  "Leptin",    121.582,
+  "MCP1",     22.26563,
+  "PYY",       40.03906,
+  "TNFa",     8.276367
+)
+
+MSD_noNAs_df <- MSD_df %>%
+  left_join(assay_min_df, by = c("biomarker")) %>%
+  mutate(
+    conc_noNA = if_else(is.na(conc_undiluted), min_conc, conc_undiluted),
+    conc_log10 = log10(conc_noNA),
+    Hp_copies_std_log10 = log10(Hp_copies_std)
+  )
+
+
+```
+
+
+
+```{r}
+#baseline analyses brms, time point b0 3 days before diet change
+
+
+# ------------------------------------------------------------
+# 1. Data
+# ------------------------------------------------------------
+MSD_noNAs_df_b0 <- MSD_noNAs_df %>%
+  filter(timepoint == "b0")
+
+df_b0 <- MSD_noNAs_df_b0 %>% 
+  mutate(
+    treatment = factor(treatment, levels = c("Ctrl", "Hp")),
+    sex       = factor(sex, levels = c("female", "male")),
+    biomarker = factor(biomarker)
+  )
+
+# ------------------------------------------------------------
+# 2. Fit one model per biomarker
+# ------------------------------------------------------------
+biomarker_ids_b0 <- unique(df_b0$biomarker)
+
+fit_cytokines_b0_by_biomarker <- biomarker_ids_b0 |>
+  set_names() |>
+  map(function(bm) {
+    dat0_bm <- df_b0 %>% filter(biomarker == bm)
+
+    brm(
+      conc_log10 ~ treatment * sex,
+      data = dat0_bm,
+      family = student(),
+      prior = c(
+        prior(normal(0, 1), class = "b"),
+        prior(student_t(3, 0, 1), class = "sigma")
+      ),
+      chains = 4, iter = 4000, warmup = 2000,
+      control = list(adapt_delta = 0.99, max_treedepth = 15),
+      backend = "cmdstanr",
+      seed = 123
+    )
+  })
+
+# ------------------------------------------------------------
+# 3. Predictions from each model
+# ------------------------------------------------------------
+preds_b0 <- imap_dfr(fit_cytokines_b0_by_biomarker, function(fit, bm) {
+  newdata_bm0 <- expand_grid(
+    sex       = levels(fit$data$sex),
+    treatment = levels(fit$data$treatment)
+  )
+
+  add_epred_draws(
+    newdata_bm0,
+    fit,
+    re_formula = NA
+  ) %>%
+    mutate(biomarker = bm)
+})
+
+# ------------------------------------------------------------
+# 4. Treatment effect within sex
+# ------------------------------------------------------------
+summary_probs_b0 <- preds_b0 %>%
+  group_by(biomarker, sex, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = treatment, values_from = epred) %>%
+  mutate(effect = Hp - Ctrl) %>%
+  group_by(biomarker, sex) %>%
+  summarise(
+    median          = median(effect),
+    CI_low          = quantile(effect, 0.025),
+    CI_high         = quantile(effect, 0.975),
+    CI80_low        = quantile(effect, 0.10),
+    CI80_high       = quantile(effect, 0.90),
+    prob_Hp_greater = mean(effect > 0),
+    is_sig          = (CI_low > 0 | CI_high < 0),
+    .groups = "drop"
+  )
+
+# biomarkers with at least one 95% CI excluding 0
+sig_biomarkers_b0 <- summary_probs_b0 %>%
+  group_by(biomarker) %>%
+  summarise(any_sig = any(is_sig), .groups = "drop") %>%
+  filter(any_sig) %>%
+  pull(biomarker)
+
+summary_probs_b0_sig_only <- summary_probs_b0 %>%
+  filter(biomarker %in% sig_biomarkers_b0)
+
+# ------------------------------------------------------------
+# 5. Plot function
+# ------------------------------------------------------------
+plot_b0_effects <- function(dat) {
+  ggplot(dat, aes(x = biomarker, y = median, color = sex)) +
+    geom_linerange(
+      aes(ymin = CI_low, ymax = CI_high),
+      position = position_dodge(width = 0.5),
+      linewidth = 0.8
+    ) +
+    geom_linerange(
+      aes(ymin = CI80_low, ymax = CI80_high),
+      position = position_dodge(width = 0.5),
+      linewidth = 2
+    ) +
+    geom_point(
+      position = position_dodge(width = 0.5),
+      size = 2
+    ) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    scale_color_manual(values = c(
+      "male"   = "#6a0dad",
+      "female" = "#b19cd9"
+    )) +
+    coord_flip() +
+    labs(
+      y = "Effect estimate (Hp - Ctrl, log10 scale)",
+      x = "Biomarker",
+      color = "Sex"
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      axis.text.y = element_text(size = 12, color = "black"),
+      panel.grid.major.y = element_blank()
+    )
+}
+
+# ------------------------------------------------------------
+# 6. Plot all biomarkers
+# ------------------------------------------------------------
+p_b0_all <- plot_b0_effects(summary_probs_b0)
+p_b0_all
+
+# ------------------------------------------------------------
+# 7. Plot only biomarkers with at least one 95% CI excluding 0
+# ------------------------------------------------------------
+p_b0_sig <- plot_b0_effects(summary_probs_b0_sig_only)
+p_b0_sig
+
+# ------------------------------------------------------------
+# 8. Save
+# ------------------------------------------------------------
+ggsave("day0_effects_all_markers.jpeg", plot = p_b0_all,
+       width = 7, height = 5, units = "in")
+
+ggsave("day0_effects_sig_markers.pdf", plot = p_b0_sig,
+       width = 10, height = 8, units = "in")
+```
+
+
+
+```{r}
+#Analyses of rest of the time points, treat time as categorical, to avoid assumption of linear effect
+
+df_lt <- MSD_noNAs_df %>%
+  filter(timepoint != "b0")
+
+df_longitudinal_cattime <- df_lt %>%
+  mutate(
+    treatment = factor(treatment, levels = c("Ctrl", "Hp")),
+    sex       = factor(sex, levels = c("female", "male")),
+    diet      = factor(diet),
+    biomarker = factor(biomarker),
+    timepoint_cat = factor(timepoint, levels = c("b1", "b2", "b3", "b4"))
+  )
+
+biomarker_ids_cattime <- unique(df_longitudinal_cattime$biomarker)
+
+fit_models_cattime_by_biomarker <- biomarker_ids_cattime |>
+  set_names() |>
+  map(function(biomarker_name_cattime) {
+    
+    df_cattime_biomarker <- df_longitudinal_cattime %>%
+      filter(biomarker == biomarker_name_cattime)
+    
+    brm(
+      conc_log10 ~ treatment * sex * diet * timepoint_cat +
+        (1 | mouseID),
+      data = df_cattime_biomarker,
+      family = student(),
+      prior = c(
+        prior(normal(0, 1), class = "b"),
+        prior(exponential(1), class = "sd"),
+        prior(student_t(3, 0, 1), class = "sigma")
+      ),
+      chains = 4, iter = 4000, warmup = 2000,
+      control = list(adapt_delta = 0.99, max_treedepth = 15),
+      backend = "cmdstanr",
+      seed = 123
+    )
+  })
+
+preds_cattime_all <- imap_dfr(fit_models_cattime_by_biomarker, function(fit_cattime_biomarker, biomarker_name_cattime) {
+  
+  fitdata_cattime_biomarker <- fit_cattime_biomarker$data
+  
+  newdata_cattime_biomarker <- expand_grid(
+    sex           = unique(fitdata_cattime_biomarker$sex),
+    treatment     = unique(fitdata_cattime_biomarker$treatment),
+    diet          = unique(fitdata_cattime_biomarker$diet),
+    timepoint_cat = unique(fitdata_cattime_biomarker$timepoint_cat)
+  )
+  
+  add_epred_draws(
+    newdata_cattime_biomarker,
+    fit_cattime_biomarker,
+    re_formula = NA
+  ) %>%
+    mutate(biomarker = biomarker_name_cattime)
+})
+
+preds_cattime_all <- preds_cattime_all %>%
+  mutate(biomarker = as.character(biomarker))
+
+time_contrasts_cattime <- preds_cattime_all %>%
+  group_by(biomarker, treatment, sex, diet, timepoint_cat, .draw) %>%
+  summarise(epred_time = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = timepoint_cat, values_from = epred_time) %>%
+  mutate(
+    contrast_b2_vs_b1 = b2 - b1,
+    contrast_b3_vs_b1 = b3 - b1,
+    contrast_b3_vs_b2 = b3 - b2
+  ) %>%
+  pivot_longer(
+    cols = starts_with("contrast_"),
+    names_to = "time_contrast",
+    values_to = "effect"
+  ) %>%
+  group_by(biomarker, treatment, sex, diet, time_contrast) %>%
+  summarise(
+    median          = median(effect),
+    CI_low          = quantile(effect, 0.025),
+    CI_high         = quantile(effect, 0.975),
+    CI80_low        = quantile(effect, 0.10),
+    CI80_high       = quantile(effect, 0.90),
+    prob_positive   = mean(effect > 0),
+    prob_negative   = mean(effect < 0),
+    has_time_effect = (CI_low > 0 | CI_high < 0),
+    has_time_effect80 = (CI80_low > 0 | CI80_high < 0),
+    .groups = "drop"
+  )
+
+preds_cattime_avgtime <- preds_cattime_all
+
+eff_main_treat_cattime_avg <- preds_cattime_avgtime %>%
+  group_by(biomarker, sex, treatment, .draw) %>%
+  summarise(epred_avgtime = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = treatment, values_from = epred_avgtime) %>%
+  mutate(effect = Hp - Ctrl) %>%
+  group_by(biomarker, sex) %>%
+  summarise(
+    median    = median(effect),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups = "drop"
+  ) %>%
+  mutate(type = "Main Effects", label = "Treatment")
+
+eff_main_diet_cattime_avg <- preds_cattime_avgtime %>%
+  group_by(biomarker, sex, diet, .draw) %>%
+  summarise(epred_avgtime = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = diet, values_from = epred_avgtime) %>%
+  mutate(effect = HFD - CD) %>%
+  group_by(biomarker, sex) %>%
+  summarise(
+    median    = median(effect),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups = "drop"
+  ) %>%
+  mutate(type = "Main Effects", label = "Diet")
+
+
+eff_interaction_cattime_avg <- preds_cattime_avgtime %>%
+  group_by(biomarker, sex, diet, treatment, .draw) %>%
+  summarise(epred_avgtime = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = c(treatment, diet), values_from = epred_avgtime) %>%
+  mutate(
+    diff_HFD = Hp_HFD - Ctrl_HFD,
+    diff_CD  = Hp_CD - Ctrl_CD,
+    effect   = diff_HFD - diff_CD
+  ) %>%
+  group_by(biomarker, sex) %>%
+  summarise(
+    median    = median(effect),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups = "drop"
+  ) %>%
+  mutate(type = "Interaction", label = "Interaction")
+
+
+eff_simple_treat_cattime_avg <- preds_cattime_avgtime %>%
+  group_by(biomarker, sex, diet, treatment, .draw) %>%
+  summarise(epred_avgtime = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = treatment, values_from = epred_avgtime) %>%
+  mutate(effect = Hp - Ctrl) %>%
+  group_by(biomarker, sex, diet) %>%
+  summarise(
+    median    = median(effect),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    type  = "Simple Effects",
+    label = paste("Treatment in", diet)
+  )
+
+
+eff_simple_diet_cattime_avg <- preds_cattime_avgtime %>%
+  group_by(biomarker, sex, diet, treatment, .draw) %>%
+  summarise(epred_avgtime = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = diet, values_from = epred_avgtime) %>%
+  mutate(effect = HFD - CD) %>%
+  group_by(biomarker, sex, treatment) %>%
+  summarise(
+    median    = median(effect),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    type  = "Simple Effects",
+    label = paste("Diet in", treatment)
+  )
+
+
+plot_data_cattime_avg <- bind_rows(
+  eff_main_treat_cattime_avg,
+  eff_main_diet_cattime_avg,
+  eff_interaction_cattime_avg,
+  eff_simple_treat_cattime_avg,
+  eff_simple_diet_cattime_avg
+) %>%
+  mutate(
+    is_sig = (CI_low > 0 | CI_high < 0),
+    is_sig80 = (CI80_low > 0 | CI80_high < 0),
+    label = factor(
+      label,
+      levels = c(
+        "Diet in Hp", "Diet in Ctrl",
+        "Treatment in HFD", "Treatment in CD",
+        "Interaction",
+        "Diet", "Treatment"
+      )
+    ),
+    type = factor(
+      type,
+      levels = c("Main Effects", "Interaction", "Simple Effects")
+    )
+  )
+
+
+
+#make the daily plots
+
+make_day_effects_from_cattime_model <- function(preds_cattime_input, day_label) {
+  
+  preds_cattime_day <- preds_cattime_input %>%
+    filter(timepoint_cat == day_label)
+  
+  # A. Main Effect: Treatment
+  eff_main_treat_cattime_day <- preds_cattime_day %>%
+    group_by(biomarker, sex, treatment, .draw) %>%
+    summarise(epred_day = mean(.epred), .groups = "drop") %>%
+    pivot_wider(names_from = treatment, values_from = epred_day) %>%
+    mutate(effect = Hp - Ctrl) %>%
+    group_by(biomarker, sex) %>%
+    summarise(
+      median    = median(effect),
+      CI_low    = quantile(effect, 0.025),
+      CI_high   = quantile(effect, 0.975),
+      CI80_low  = quantile(effect, 0.10),
+      CI80_high = quantile(effect, 0.90),
+      .groups = "drop"
+    ) %>%
+    mutate(type = "Main Effects", label = "Treatment")
+  
+  # B. Main Effect: Diet
+  eff_main_diet_cattime_day <- preds_cattime_day %>%
+    group_by(biomarker, sex, diet, .draw) %>%
+    summarise(epred_day = mean(.epred), .groups = "drop") %>%
+    pivot_wider(names_from = diet, values_from = epred_day) %>%
+    mutate(effect = HFD - CD) %>%
+    group_by(biomarker, sex) %>%
+    summarise(
+      median    = median(effect),
+      CI_low    = quantile(effect, 0.025),
+      CI_high   = quantile(effect, 0.975),
+      CI80_low  = quantile(effect, 0.10),
+      CI80_high = quantile(effect, 0.90),
+      .groups = "drop"
+    ) %>%
+    mutate(type = "Main Effects", label = "Diet")
+  
+  # C. Treatment × Diet interaction
+  eff_interaction_cattime_day <- preds_cattime_day %>%
+    group_by(biomarker, sex, diet, treatment, .draw) %>%
+    summarise(epred_day = mean(.epred), .groups = "drop") %>%
+    pivot_wider(names_from = c(treatment, diet), values_from = epred_day) %>%
+    mutate(
+      diff_HFD = Hp_HFD - Ctrl_HFD,
+      diff_CD  = Hp_CD - Ctrl_CD,
+      effect   = diff_HFD - diff_CD
+    ) %>%
+    group_by(biomarker, sex) %>%
+    summarise(
+      median    = median(effect),
+      CI_low    = quantile(effect, 0.025),
+      CI_high   = quantile(effect, 0.975),
+      CI80_low  = quantile(effect, 0.10),
+      CI80_high = quantile(effect, 0.90),
+      .groups = "drop"
+    ) %>%
+    mutate(type = "Interaction", label = "Interaction")
+  
+  # D. Simple Effects: Treatment within Diet
+  eff_simple_treat_cattime_day <- preds_cattime_day %>%
+    group_by(biomarker, sex, diet, treatment, .draw) %>%
+    summarise(epred_day = mean(.epred), .groups = "drop") %>%
+    pivot_wider(names_from = treatment, values_from = epred_day) %>%
+    mutate(effect = Hp - Ctrl) %>%
+    group_by(biomarker, sex, diet) %>%
+    summarise(
+      median    = median(effect),
+      CI_low    = quantile(effect, 0.025),
+      CI_high   = quantile(effect, 0.975),
+      CI80_low  = quantile(effect, 0.10),
+      CI80_high = quantile(effect, 0.90),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      type  = "Simple Effects",
+      label = paste("Treatment in", diet)
+    )
+  
+  # E. Simple Effects: Diet within Treatment
+  eff_simple_diet_cattime_day <- preds_cattime_day %>%
+    group_by(biomarker, sex, diet, treatment, .draw) %>%
+    summarise(epred_day = mean(.epred), .groups = "drop") %>%
+    pivot_wider(names_from = diet, values_from = epred_day) %>%
+    mutate(effect = HFD - CD) %>%
+    group_by(biomarker, sex, treatment) %>%
+    summarise(
+      median    = median(effect),
+      CI_low    = quantile(effect, 0.025),
+      CI_high   = quantile(effect, 0.975),
+      CI80_low  = quantile(effect, 0.10),
+      CI80_high = quantile(effect, 0.90),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      type  = "Simple Effects",
+      label = paste("Diet in", treatment)
+    )
+  
+  plot_data_cattime_day <- bind_rows(
+    eff_main_treat_cattime_day,
+    eff_main_diet_cattime_day,
+    eff_interaction_cattime_day,
+    eff_simple_treat_cattime_day,
+    eff_simple_diet_cattime_day
+  ) %>%
+    mutate(
+      timepoint_cat = day_label,
+      is_sig = (CI_low > 0 | CI_high < 0),
+      is_sig80 = (CI80_low > 0 | CI80_high < 0),
+      label = factor(
+        label,
+        levels = c(
+          "Diet in Hp", "Diet in Ctrl",
+          "Treatment in HFD", "Treatment in CD",
+          "Interaction",
+          "Diet", "Treatment"
+        )
+      ),
+      type = factor(
+        type,
+        levels = c("Main Effects", "Interaction", "Simple Effects")
+      )
+    )
+  
+  plot_data_cattime_day
+}
+
+day_levels_cattime <- levels(df_longitudinal_cattime$timepoint_cat)
+
+plot_data_cattime_by_day <- set_names(day_levels_cattime) |>
+  map(~ make_day_effects_from_cattime_model(preds_cattime_all, .x))
+
+
+
+plot_data_cattime_simple_all_days <- imap_dfr(
+  plot_data_cattime_by_day,
+  function(plot_df_cattime_day, day_label) {
+    plot_df_cattime_day %>%
+      mutate(timepoint_cat = day_label)
+  }
+) %>%
+  filter(type == "Simple Effects") %>%
+  mutate(
+    timepoint_cat = factor(timepoint_cat, levels = c("b1", "b2", "b3", "b4")),
+    biomarker = factor(biomarker),
+    label = factor(
+      label,
+      levels = c(
+        "Diet in Hp", "Diet in Ctrl",
+        "Treatment in HFD", "Treatment in CD"
+      )
+    )
+  )
+
+plot_data_cattime_simple_all_days <- plot_data_cattime_simple_all_days %>%
+  mutate(
+    color_group = case_when(
+      is_sig80 & sex == "female" ~ "female_sig",
+      is_sig80 & sex == "male"   ~ "male_sig",
+      !is_sig80 & sex == "female" ~ "female_nonsig",
+      !is_sig80 & sex == "male"   ~ "male_nonsig"
+    )
+  )
+
+p_simpleeffects_by_day <- ggplot(
+  plot_data_cattime_simple_all_days,
+  aes(x = label, y = median, color = color_group)
+) +
+  geom_linerange(
+    aes(ymin = CI_low, ymax = CI_high),
+    position = position_dodge(width = 0.6),
+    linewidth = 0.5
+  ) +
+  geom_linerange(
+    aes(ymin = CI80_low, ymax = CI80_high),
+    position = position_dodge(width = 0.6),
+    linewidth = 1.8
+  ) +
+  geom_point(
+    position = position_dodge(width = 0.6),
+    size = 1.8
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_y_continuous(limits = c(-1.1, 1.6)) +
+  coord_flip() +
+  facet_grid(
+  rows = vars(biomarker),
+  cols = vars(timepoint_cat),
+  labeller = labeller(
+    timepoint_cat = c(
+      b1 = "One week on diet, 4h fast",
+      b2 = "Two weeks on diet, 4h fast",
+      b3 = "Three weeks on diet, 4h fast",
+      b4 = "Four weeks on diet, 12h fast"
+    )
+  )
+) +
+  scale_color_manual(
+    values = c(
+      female_sig    = "#b19cd9",
+      male_sig      = "#6a0dad",
+      female_nonsig = "#d9d9d9",
+      male_nonsig   = "#8c8c8c"
+    ),
+    labels = c(
+      female_sig    = "Female (CI80 ≠ 0)",
+      male_sig      = "Male (CI80 ≠ 0)",
+      female_nonsig = "Female (CI80 overlaps 0)",
+      male_nonsig   = "Male (CI80 overlaps 0)"
+    )
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.text.y = element_text(color = "black", size = 8),
+    strip.text.y = element_text(face = "bold"),
+    strip.text.x = element_text(face = "bold"),
+    legend.position = "bottom"
+  ) +
+  labs(
+    x = "",
+    y = "Effect Estimate (Log10 difference)",
+    color = "Sex / Evidence"
+  )
+
+p_simpleeffects_by_day
+
+ggsave("p_simpleeffects_by_day.jpeg", plot = p_simpleeffects_by_day, width = 8.5, height = 8.5, units = "in")
+
+```
+
+
+
+```{r}
+#line plot of effects changing over time, simple effects treatment in diet - 95% CI
+
+plot_data_treatment_simple_lines <- plot_data_cattime_simple_all_days %>%
+  filter(label %in% c("Treatment in CD", "Treatment in HFD")) %>%
+  mutate(
+    diet = case_when(
+      label == "Treatment in CD"  ~ "CD",
+      label == "Treatment in HFD" ~ "HFD"
+    ),
+    timepoint_cat = factor(
+      timepoint_cat,
+      levels = c("b1", "b2", "b3", "b4"),
+      labels = c(
+        "1W PDS, 4h fast",
+        "2W PDS, 4h fast",
+        "3W PDS, 4h fast",
+        "4W PDS, 12h fast"
+      )
+    ),
+    is_sig80 = (CI80_low > 0 | CI80_high < 0),
+    is_sig95 = (CI_low > 0 | CI_high < 0)
+  )
+
+p_treatment_effect_lines <- ggplot(
+  plot_data_treatment_simple_lines,
+  aes(
+    x = timepoint_cat,
+    y = median,
+    group = interaction(sex, diet),
+    color = sex,
+    linetype = diet
+  )
+) +
+  geom_hline(
+    yintercept = 0,
+    color = "#333333",
+    linewidth = 0.6
+  ) +
+  geom_line(linewidth = 1) +
+  geom_errorbar(
+  aes(ymin = CI_low, ymax = CI_high),
+  width = 0.15,
+  linewidth = 0.4,
+  linetype = "solid"
+) +
+geom_point(
+  data = ~ dplyr::filter(.x, is_sig80),
+  shape = 21,
+  stroke = 0.7,
+  fill = "white",
+  color = "black",
+  size = 2.8
+) +
+geom_point(
+  data = ~ dplyr::filter(.x, is_sig95),
+  color = "black",
+  size = 0.9,
+  show.legend = FALSE
+) +
+
+  geom_point(size = 1.3) +
+  facet_grid(
+    biomarker ~ sex
+  ) +
+  scale_color_manual(
+    values = c(
+      female = "#b19cd9",
+      male   = "#6a0dad"
+    )
+  ) +
+  scale_linetype_manual(
+    values = c(
+      CD  = "dotted",
+      HFD = "solid"
+    )
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom"
+  ) +
+  labs(
+    x = "",
+    y = "Hp − Ctrl effect (log10 biomarker)",
+    color = "Sex",
+    linetype = "Diet"
+  )
+
+p_treatment_effect_lines
+
+
+# Save
+ggsave("treatment_trajectories.jpeg", plot = p_treatment_effect_lines, width = 5, height = 10.5, units = "in")
+
+```
+
+
+
+```{r}
+# line plot of effects changing over time, simple effects diet in treatment - 95% CI
+
+plot_data_diet_simple_lines <- plot_data_cattime_simple_all_days %>%
+  filter(label %in% c("Diet in Ctrl", "Diet in Hp")) %>%
+  mutate(
+    treatment = case_when(
+      label == "Diet in Ctrl" ~ "Ctrl",
+      label == "Diet in Hp"   ~ "Hp"
+    ),
+    timepoint_cat = factor(
+      timepoint_cat,
+      levels = c("b1", "b2", "b3", "b4"),
+      labels = c(
+        "1W PDS, 4h fast",
+        "2W PDS, 4h fast",
+        "3W PDS, 4h fast",
+        "4W PDS, 12h fast"
+      )
+    ),
+    is_sig95 = (CI_low > 0 | CI_high < 0)
+  )
+
+p_diet_effect_lines <- ggplot(
+  plot_data_diet_simple_lines,
+  aes(
+    x = timepoint_cat,
+    y = median,
+    group = interaction(sex, treatment),
+    color = sex,
+    linetype = treatment
+  )
+) +
+  geom_hline(
+    yintercept = 0,
+    color = "#333333",
+    linewidth = 0.6
+  ) +
+  geom_line(linewidth = 1) +
+  geom_errorbar(
+    aes(ymin = CI_low, ymax = CI_high),
+    width = 0.15,
+    linewidth = 0.4,
+    linetype = "solid"
+  ) +
+  geom_point(
+    data = ~ dplyr::filter(.x, is_sig95),
+    shape = 21,
+    stroke = 0.7,
+    fill = "white",
+    color = "black",
+    size = 2.8
+  ) +
+  geom_point(size = 1.3) +
+  facet_grid(
+    biomarker ~ sex
+  ) +
+  scale_color_manual(
+    values = c(
+      female = "#b19cd9",
+      male   = "#6a0dad"
+    )
+  ) +
+  scale_linetype_manual(
+    values = c(
+      Ctrl = "dotted",
+      Hp   = "solid"
+    )
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom"
+  ) +
+  labs(
+    x = "",
+    y = "HFD − CD effect (log10 biomarker)",
+    color = "Sex",
+    linetype = "Treatment"
+  )
+
+p_diet_effect_lines
+
+
+```
+
+
+
+
+```{r}
+#WAT weight figure
+
+# --- 1. FIT MODEL, select random biomarker for filtering  ---
+MSD_noNAs_df_b4_wat <- MSD_noNAs_df %>%
+  filter(timepoint == "b4", biomarker == "Ghrelin", !is.na(new_wat_weight)) 
+
+df_b4_WAT <- MSD_noNAs_df_b4_wat %>% 
+  mutate(
+    treatment = factor(treatment, levels = c("Ctrl", "Hp")),
+    sex       = factor(sex, levels = c("female", "male")),
+    diet      = factor(diet, levels = c("CD", "HFD"))
+  )
+   
+fit_wat_b4 <- brm(
+  new_wat_weight ~ treatment * sex * diet,
+  data = df_b4_WAT,
+  family = student(),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(student_t(3, 0, 1), class = "sigma")
+  ),
+  chains = 4, iter = 4000, warmup = 2000,
+  control = list(adapt_delta = 0.99),
+  backend = "cmdstanr", seed = 123
+)
+
+
+# --- 2. PREDICTIONS ---
+newdata_b4_WAT <- expand_grid(
+  sex       = unique(df_b4_WAT$sex),
+  treatment = unique(df_b4_WAT$treatment),
+  diet      = unique(df_b4_WAT$diet)
+)
+
+preds_b4_WAT <- add_epred_draws(newdata_b4_WAT, fit_wat_b4)
+
+# --- 3. CALCULATE EFFECTS AS PERCENTAGE CHANGE ---
+# Formula: ((Test / Reference) - 1) * 100
+
+# A. Main Effects (Pooled)
+eff_main_treat <- preds_b4_WAT %>%
+  group_by(sex, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = treatment, values_from = epred) %>%
+  # CHANGE: Calculate % Change
+  mutate(effect = (Hp / Ctrl - 1) * 100) %>%
+  group_by(sex) %>%
+  summarise(median = median(effect), CI_low = quantile(effect, 0.025), CI_high = quantile(effect, 0.975), .groups="drop") %>%
+  mutate(type = "Main Effects", label = "Treatment")
+
+eff_main_diet <- preds_b4_WAT %>%
+  group_by(sex, diet, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = diet, values_from = epred) %>%
+  #  Calculate % Change
+  mutate(effect = (HFD / CD - 1) * 100) %>%
+  group_by(sex) %>%
+  summarise(median = median(effect), CI_low = quantile(effect, 0.025), CI_high = quantile(effect, 0.975), .groups="drop") %>%
+  mutate(type = "Main Effects", label = "Diet")
+
+# C. Simple Effects
+eff_simple_treat <- preds_b4_WAT %>%
+  group_by(sex, diet, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = treatment, values_from = epred) %>%
+  #  Calculate % Change
+  mutate(effect = (Hp / Ctrl - 1) * 100) %>%
+  group_by(sex, diet) %>%
+  summarise(median = median(effect), CI_low = quantile(effect, 0.025), CI_high = quantile(effect, 0.975), .groups="drop") %>%
+  mutate(type = "Simple Effects", label = paste("Treatment in", diet))
+
+eff_simple_diet <- preds_b4_WAT %>%
+  group_by(sex, diet, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = diet, values_from = epred) %>%
+  # Calculate % Change
+  mutate(effect = (HFD / CD - 1) * 100) %>%
+  group_by(sex, treatment) %>%
+  summarise(median = median(effect), CI_low = quantile(effect, 0.025), CI_high = quantile(effect, 0.975), .groups="drop") %>%
+  mutate(type = "Simple Effects", label = paste("Diet in", treatment))
+
+# B. Interaction (Difference of Percentages)
+eff_interaction <- preds_b4_WAT %>%
+  group_by(sex, diet, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = c(treatment, diet), values_from = epred) %>%
+  mutate(
+    # % Effect of Hp in HFD
+    pct_HFD = (Hp_HFD / Ctrl_HFD - 1) * 100,
+    # % Effect of Hp in CD
+    pct_CD  = (Hp_CD / Ctrl_CD - 1) * 100,
+    # Interaction = Difference in % points
+    effect  = pct_HFD - pct_CD
+  ) %>%
+  group_by(sex) %>%
+  summarise(median = median(effect), CI_low = quantile(effect, 0.025), CI_high = quantile(effect, 0.975), .groups="drop") %>%
+  mutate(type = "Interaction", label = "Interaction")
+
+# --- 4. COMBINE AND ORDER ---
+plot_df_wat <- bind_rows(eff_main_treat, eff_main_diet, eff_interaction, eff_simple_treat, eff_simple_diet) %>%
+  mutate(
+    label = factor(label, levels = c(
+      "Diet in Hp", "Diet in Ctrl", 
+      "Treatment in HFD", "Treatment in CD", 
+      "Interaction",
+      "Diet", "Treatment"
+    )),
+    type = factor(type, levels = c("Main Effects", "Interaction", "Simple Effects"))
+  )
+
+# --- 5. PLOT ---
+WAT_plot <- ggplot(plot_df_wat, aes(x = label, y = median, color = sex)) +
+  
+  geom_pointrange(aes(ymin = CI_low, ymax = CI_high, shape = type), 
+                  position = position_dodge(width = 0.6), size = 0.8) +
+  
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  
+  
+  scale_color_manual(values = c("female" = "#b19cd9", "male" = "#6a0dad")) +
+  
+  scale_shape_manual(values = c(
+    "Main Effects"   = 16, 
+    "Interaction"    = 18, 
+    "Simple Effects" = 15  
+  )) +
+  
+  # --- CONTROL LEGEND ORDER HERE ---
+  guides(
+    shape = guide_legend(order = 1), # Effect Type on Top
+    color = guide_legend(order = 2)  # Sex Below
+  ) +
+  
+  theme_bw(base_size = 14) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.text.y        = element_text(color = "black"),
+    strip.text         = element_text(face = "bold"),
+    
+    # --- STACK LEGENDS VERTICALLY ---
+    legend.position    = "bottom",
+    legend.box         = "vertical",  # Stacks the two legends
+    legend.margin      = margin(t = 0, b = 0, unit = "pt") # tighter spacing
+  ) +
+  labs(
+    x = "", 
+    y = "Effect Estimate (% change)", 
+    color = "Sex", shape = "Effect Type"
+  )
+
+WAT_plot <- WAT_plot +
+  theme(
+    plot.margin = margin(
+      t = 10,
+      r = 30,  
+      b = 10,
+      l = 10,
+      unit = "pt"
+    )
+  )
+
+# Save
+ggsave("WAT_effects_percent.jpeg", plot = WAT_plot, width = 6.5, height = 5, units = "in")
+
+WAT_plot
+```
+
+
+
+```{r}
+#final time point at sacrifice, is there an effect of Hp_load and WAT weight?
+
+MSD_noNAs_df_b4 <- MSD_noNAs_df %>%
+  filter(timepoint == "b4")
+
+df_b4 <- MSD_noNAs_df_b4 %>% 
+  mutate(
+    treatment = factor(treatment, levels = c("Ctrl", "Hp")),
+    sex       = factor(sex, levels = c("female", "male")),
+    biomarker = factor(biomarker),
+    diet = factor(diet)
+  )
+
+df_inf <- df_b4 %>%
+  filter(treatment == "Hp")
+
+biomarker_ids <- unique(df_inf$biomarker)
+
+fit_cytokines_b4_by_biomarker_HpWAT <- biomarker_ids |>
+  set_names() |>
+  map(function(bm) {
+
+    dat_bm <- df_inf %>%
+      filter(biomarker == bm) %>%
+      mutate(
+        sex  = factor(sex, levels = c("female", "male")),
+        diet = factor(diet, levels = c("CD", "HFD")),
+        Hp_z  = as.numeric(scale(Hp_copies_std_log10)),
+        WAT_z = as.numeric(scale(new_wat_weight))
+      )
+
+    brm(
+      conc_log10 ~ sex * diet + Hp_z * sex * diet + WAT_z,
+      data = dat_bm,
+      family = student(),
+      prior = c(
+        prior(normal(0, 1), class = "b"),
+        prior(student_t(3, 0, 1), class = "sigma")
+      ),
+      chains = 4, iter = 4000, warmup = 2000,
+      control = list(adapt_delta = 0.99, max_treedepth = 15),
+      backend = "cmdstanr",
+      seed = 123
+    )
+  })
+
+preds_Hp_inf <- imap_dfr(fit_cytokines_b4_by_biomarker_HpWAT, function(fit, bm) {
+
+  dat_bm <- fit$data
+
+  Hp_vals <- seq(
+    min(dat_bm$Hp_z, na.rm = TRUE),
+    max(dat_bm$Hp_z, na.rm = TRUE),
+    length.out = 50
+  )
+
+  newdata_bm_Hp <- expand_grid(
+    sex  = levels(dat_bm$sex),
+    diet = levels(dat_bm$diet),
+    Hp_z = Hp_vals,
+    WAT_z = 0
+  )
+
+  add_epred_draws(
+    object = fit,
+    newdata = newdata_bm_Hp,
+    re_formula = NA
+  ) %>%
+    mutate(biomarker = bm)
+})
+
+preds_Hp_inf <- imap_dfr(fit_cytokines_b4_by_biomarker_HpWAT, function(fit, bm) {
+
+  dat_bm <- fit$data
+
+  Hp_vals <- seq(
+    min(dat_bm$Hp_z, na.rm = TRUE),
+    max(dat_bm$Hp_z, na.rm = TRUE),
+    length.out = 50
+  )
+
+  newdata_bm_Hp <- expand_grid(
+    sex  = levels(dat_bm$sex),
+    diet = levels(dat_bm$diet),
+    Hp_z = Hp_vals,
+    WAT_z = 0
+  )
+
+  add_epred_draws(
+    object = fit,
+    newdata = newdata_bm_Hp,
+    re_formula = NA
+  ) %>%
+    mutate(biomarker = bm)
+})
+
+preds_Hp_inf_sum <- preds_Hp_inf %>%
+  group_by(biomarker, sex, diet, Hp_z) %>%
+  summarise(
+    median    = median(.epred),
+    CI_low    = quantile(.epred, 0.025),
+    CI_high   = quantile(.epred, 0.975),
+    CI80_low  = quantile(.epred, 0.10),
+    CI80_high = quantile(.epred, 0.90),
+    .groups = "drop"
+  )
+
+p_Hp_lines <- ggplot(
+  preds_Hp_inf_sum,
+  aes(x = Hp_z, y = median, color = diet, fill = diet)
+) +
+  geom_ribbon(aes(ymin = CI_low, ymax = CI_high), alpha = 0.12, color = NA) +
+  geom_line(linewidth = 0.9) +
+  facet_grid(sex ~ biomarker, scales = "free_y") +
+  scale_color_manual(values = c("CD" = "#0072B2", "HFD" = "#D55E00")) +
+  scale_fill_manual(values = c("CD" = "#0072B2", "HFD" = "#D55E00")) +
+  theme_bw(base_size = 11) +
+  theme(
+    panel.grid.major = element_blank(),
+    strip.text = element_text(face = "bold")
+  ) +
+  labs(
+    x = "Hp load (z-score)",
+    y = "Predicted biomarker concentration (log10)",
+    color = "Diet",
+    fill = "Diet"
+  )
+
+p_Hp_lines
+
+Hp_slopes_inf <- preds_Hp_inf %>%
+  group_by(biomarker, sex, diet, .draw) %>%
+  arrange(Hp_z, .by_group = TRUE) %>%
+  summarise(
+    Hp_min = first(Hp_z),
+    Hp_max = last(Hp_z),
+    pred_min = first(.epred),
+    pred_max = last(.epred),
+    slope = (pred_max - pred_min) / (Hp_max - Hp_min),
+    .groups = "drop"
+  ) %>%
+  group_by(biomarker, sex, diet) %>%
+  summarise(
+    median    = median(slope),
+    CI_low    = quantile(slope, 0.025),
+    CI_high   = quantile(slope, 0.975),
+    CI80_low  = quantile(slope, 0.10),
+    CI80_high = quantile(slope, 0.90),
+    prob_pos  = mean(slope > 0),
+    prob_neg  = mean(slope < 0),
+    is_sig80  = (CI80_low > 0 | CI80_high < 0),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    group = factor(
+      paste(sex, diet, sep = " | "),
+      levels = c(
+        "female | CD",
+        "female | HFD",
+        "male | CD",
+        "male | HFD"
+      )
+    )
+  )
+
+p_Hp_forest_inf <- ggplot(
+  Hp_slopes_inf,
+  aes(x = group, y = median, color = sex)
+) +
+  geom_linerange(
+    aes(ymin = CI_low, ymax = CI_high),
+    position = position_dodge(width = 0.5),
+    linewidth = 0.6
+  ) +
+  geom_linerange(
+    aes(ymin = CI80_low, ymax = CI80_high),
+    position = position_dodge(width = 0.5),
+    linewidth = 2
+  ) +
+  geom_point(
+    position = position_dodge(width = 0.5),
+    size = 2
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  facet_wrap(~ biomarker, nrow = 3, scales = "free_y") +
+  scale_color_manual(values = c("female" = "#b19cd9", "male" = "#6a0dad")) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.text.y = element_text(color = "black"),
+    strip.text = element_text(face = "bold")
+  ) +
+  labs(
+    x = "",
+    y = "Slope for Hp load (change in log10 biomarker per 1 SD increase in Hp load)",
+    color = "Sex"
+  )
+
+p_Hp_forest_inf
+
+preds_WAT_inf <- imap_dfr(fit_cytokines_b4_by_biomarker_HpWAT, function(fit, bm) {
+
+  dat_bm <- fit$data
+
+  WAT_vals <- seq(
+    min(dat_bm$WAT_z, na.rm = TRUE),
+    max(dat_bm$WAT_z, na.rm = TRUE),
+    length.out = 50
+  )
+
+  newdata_bm_WAT <- expand_grid(
+    sex  = levels(dat_bm$sex),
+    diet = levels(dat_bm$diet),
+    Hp_z = 0,
+    WAT_z = WAT_vals
+  )
+
+  add_epred_draws(
+    object = fit,
+    newdata = newdata_bm_WAT,
+    re_formula = NA
+  ) %>%
+    mutate(biomarker = bm)
+})
+
+WAT_slopes_inf <- preds_WAT_inf %>%
+  group_by(biomarker, .draw) %>%
+  arrange(WAT_z, .by_group = TRUE) %>%
+  summarise(
+    WAT_min = first(WAT_z),
+    WAT_max = last(WAT_z),
+    pred_min = first(.epred),
+    pred_max = last(.epred),
+    slope = (pred_max - pred_min) / (WAT_max - WAT_min),
+    .groups = "drop"
+  ) %>%
+  group_by(biomarker) %>%
+  summarise(
+    median    = median(slope),
+    CI_low    = quantile(slope, 0.025),
+    CI_high   = quantile(slope, 0.975),
+    CI80_low  = quantile(slope, 0.10),
+    CI80_high = quantile(slope, 0.90),
+    prob_pos  = mean(slope > 0),
+    prob_neg  = mean(slope < 0),
+    is_sig80  = (CI80_low > 0 | CI80_high < 0),
+    .groups = "drop"
+  ) %>%
+  mutate(group = "WAT effect")
+
+p_WAT_forest_inf <- ggplot(
+  WAT_slopes_inf,
+  aes(x = group, y = median)
+) +
+  geom_linerange(
+    aes(ymin = CI_low, ymax = CI_high),
+    linewidth = 0.6,
+    color = "#0072B2"
+  ) +
+  geom_linerange(
+    aes(ymin = CI80_low, ymax = CI80_high),
+    linewidth = 2,
+    color = "#0072B2"
+  ) +
+  geom_point(
+    size = 2,
+    color = "#0072B2"
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  facet_wrap(~ biomarker, nrow = 3, scales = "free_y") +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.text.y = element_text(color = "black"),
+    strip.text = element_text(face = "bold")
+  ) +
+  labs(
+    x = "",
+    y = "Slope for WAT weight (change in log10 biomarker per 1 SD increase in WAT)",
+    color = NULL
+  )
+
+p_WAT_forest_inf
+
+sig80_biomarkers_Hp <- Hp_slopes_inf %>%
+  group_by(biomarker) %>%
+  summarise(any_sig80 = any(is_sig80), .groups = "drop") %>%
+  filter(any_sig80) %>%
+  pull(biomarker)
+
+Hp_slopes_inf_sig80 <- Hp_slopes_inf %>%
+  filter(biomarker %in% sig80_biomarkers_Hp)
+
+sig80_biomarkers_WAT <- WAT_slopes_inf %>%
+  filter(is_sig80) %>%
+  pull(biomarker)
+
+WAT_slopes_inf_sig80 <- WAT_slopes_inf %>%
+  filter(biomarker %in% sig80_biomarkers_WAT)
+
+
+
+library(cowplot)
+
+WAT_Hp_figure <- plot_grid(
+  p_Hp_forest_inf, p_WAT_forest_inf,
+  
+  ncol = 2,
+  labels = c("A", "B"),
+  align = "hv",
+  axis = "tblr",
+  rel_widths = c(1, 1),
+  rel_heights = c(1, 1.1)
+)
+
+WAT_Hp_figure
+
+
+```
+```{r}
+#combined plot
+
+# Hp rows
+Hp_plot_df <- Hp_slopes_inf %>%
+  mutate(
+    predictor = "Hp load",
+    effect_label = factor(
+      paste("Hp |", sex, "|", diet),
+      levels = c(
+        "Hp | female | CD",
+        "Hp | female | HFD",
+        "Hp | male | CD",
+        "Hp | male | HFD",
+        "WAT"
+      )
+    ),
+    color_group = case_when(
+      is_sig80 & sex == "female" ~ "female_sig",
+      is_sig80 & sex == "male"   ~ "male_sig",
+      !is_sig80 & sex == "female" ~ "female_nonsig",
+      !is_sig80 & sex == "male"   ~ "male_nonsig"
+    )
+  )
+
+# WAT row
+WAT_plot_df <- WAT_slopes_inf %>%
+  mutate(
+    predictor = "WAT",
+    sex = "all",
+    diet = "all",
+    effect_label = factor("WAT", levels = c(
+      "Hp | female | CD",
+      "Hp | female | HFD",
+      "Hp | male | CD",
+      "Hp | male | HFD",
+      "WAT"
+    )),
+    color_group = case_when(
+      is_sig80 ~ "wat_sig",
+      !is_sig80 ~ "wat_nonsig"
+    )
+  )
+
+# combine
+combined_slopes_df <- bind_rows(Hp_plot_df, WAT_plot_df)
+
+
+# Hp rows
+Hp_plot_df <- Hp_slopes_inf %>%
+  mutate(
+    predictor = "Hp load",
+    effect_label = factor(
+      paste("Hp |", sex, "|", diet),
+      levels = c(
+        "Hp | female | CD",
+        "Hp | female | HFD",
+        "Hp | male | CD",
+        "Hp | male | HFD",
+        "WAT"
+      )
+    ),
+    color_group = case_when(
+      is_sig80 & sex == "female" ~ "female_sig",
+      is_sig80 & sex == "male"   ~ "male_sig",
+      !is_sig80 & sex == "female" ~ "female_nonsig",
+      !is_sig80 & sex == "male"   ~ "male_nonsig"
+    )
+  )
+
+# WAT row
+WAT_plot_df <- WAT_slopes_inf %>%
+  mutate(
+    predictor = "WAT",
+    sex = "all",
+    diet = "all",
+    effect_label = factor("WAT", levels = c(
+      "Hp | female | CD",
+      "Hp | female | HFD",
+      "Hp | male | CD",
+      "Hp | male | HFD",
+      "WAT"
+    )),
+    color_group = case_when(
+      is_sig80 ~ "wat_sig",
+      !is_sig80 ~ "wat_nonsig"
+    )
+  )
+
+# combine
+combined_slopes_df <- bind_rows(Hp_plot_df, WAT_plot_df)
+
+
+
+# Hp rows
+Hp_plot_df <- Hp_slopes_inf %>%
+  mutate(
+    predictor = "Hp load",
+    effect_label = factor(
+      paste("Hp |", sex, "|", diet),
+      levels = c(
+        "Hp | female | CD",
+        "Hp | female | HFD",
+        "Hp | male | CD",
+        "Hp | male | HFD",
+        "WAT"
+      )
+    ),
+    color_group = case_when(
+      is_sig80 & sex == "female" ~ "female_sig",
+      is_sig80 & sex == "male"   ~ "male_sig",
+      !is_sig80 & sex == "female" ~ "female_nonsig",
+      !is_sig80 & sex == "male"   ~ "male_nonsig"
+    )
+  )
+
+# WAT row
+WAT_plot_df <- WAT_slopes_inf %>%
+  mutate(
+    predictor = "WAT",
+    sex = "all",
+    diet = "all",
+    effect_label = factor("WAT", levels = c(
+      "Hp | female | CD",
+      "Hp | female | HFD",
+      "Hp | male | CD",
+      "Hp | male | HFD",
+      "WAT"
+    )),
+    color_group = case_when(
+      is_sig80 ~ "wat_sig",
+      !is_sig80 ~ "wat_nonsig"
+    )
+  )
+
+# combine
+combined_slopes_df <- bind_rows(Hp_plot_df, WAT_plot_df)
+
+combined_forest_plot <- ggplot(
+  combined_slopes_df,
+  aes(x = effect_label, y = median, color = color_group)
+) +
+  geom_linerange(
+    aes(ymin = CI_low, ymax = CI_high),
+    linewidth = 0.6
+  ) +
+  geom_linerange(
+    aes(ymin = CI80_low, ymax = CI80_high),
+    linewidth = 2
+  ) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  facet_wrap(~ biomarker, nrow = 3, scales = "free_y") +
+  scale_color_manual(
+    values = c(
+      female_sig    = "#b19cd9",
+      male_sig      = "#6a0dad",
+      female_nonsig = "#d9d9d9",
+      male_nonsig   = "#8c8c8c",
+      wat_sig       = "#0072B2",
+      wat_nonsig    = "#9ecae1"
+    ),
+    labels = c(
+      female_sig    = "Hp female (CI80 ≠ 0)",
+      male_sig      = "Hp male (CI80 ≠ 0)",
+      female_nonsig = "Hp female (CI80 overlaps 0)",
+      male_nonsig   = "Hp male (CI80 overlaps 0)",
+      wat_sig       = "WAT (CI80 ≠ 0)",
+      wat_nonsig    = "WAT (CI80 overlaps 0)"
+    )
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.text.y = element_text(color = "black"),
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom"
+  ) +
+  labs(
+    x = "",
+    y = "Slope (change in log10 biomarker per 1 SD increase)",
+    color = "Predictor / Evidence"
+  )
+
+combined_forest_plot
+```
+
+```{r}
+#testing which model to go with
+
+df_inf_IL6 <- df_b4 %>%
+  filter(treatment == "Hp", biomarker == "IL6") %>%
+  mutate(
+    sex  = factor(sex, levels = c("female", "male")),
+    diet = factor(diet, levels = c("CD", "HFD")),
+    Hp_z  = as.numeric(scale(Hp_copies_std_log10)),
+    WAT_z = as.numeric(scale(new_wat_weight))
+  )
+
+df_inf_Ghre <- df_b4 %>%
+  filter(treatment == "Hp", biomarker == "Ghrelin") %>%
+  mutate(
+    sex  = factor(sex, levels = c("female", "male")),
+    diet = factor(diet, levels = c("CD", "HFD")),
+    Hp_z  = as.numeric(scale(Hp_copies_std_log10)),
+    WAT_z = as.numeric(scale(new_wat_weight))
+  )
+
+df_inf_Lep <- df_b4 %>%
+  filter(treatment == "Hp", biomarker == "Leptin") %>%
+  mutate(
+    sex  = factor(sex, levels = c("female", "male")),
+    diet = factor(diet, levels = c("CD", "HFD")),
+    Hp_z  = as.numeric(scale(Hp_copies_std_log10)),
+    WAT_z = as.numeric(scale(new_wat_weight))
+  )
+
+fit_base <- brm(
+  conc_log10 ~ sex * diet + Hp_z * sex * diet + WAT_z,
+  data = df_inf_Lep,
+  family = student(),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(student_t(3, 0, 1), class = "sigma")
+  ),
+  chains = 4, iter = 4000, warmup = 2000,
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  backend = "cmdstanr",
+  seed = 123
+)
+
+fit_wat_sex <- brm(
+  conc_log10 ~ sex * diet + Hp_z * sex * diet + WAT_z * sex,
+  data = df_inf_Lep,
+  family = student(),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(student_t(3, 0, 1), class = "sigma")
+  ),
+  chains = 4, iter = 4000, warmup = 2000,
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  backend = "cmdstanr",
+  seed = 123
+)
+
+fit_wat_diet <- brm(
+  conc_log10 ~ sex * diet + Hp_z * sex * diet + WAT_z * diet,
+  data = df_inf_Lep,
+  family = student(),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(student_t(3, 0, 1), class = "sigma")
+  ),
+  chains = 4, iter = 4000, warmup = 2000,
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  backend = "cmdstanr",
+  seed = 123
+)
+
+fit_wat_full <- brm(
+  conc_log10 ~ sex * diet + Hp_z * sex * diet + WAT_z * sex * diet,
+  data = df_inf_Lep,
+  family = student(),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(student_t(3, 0, 1), class = "sigma")
+  ),
+  chains = 4, iter = 4000, warmup = 2000,
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  backend = "cmdstanr",
+  seed = 123
+)
+
+library(loo)
+
+loo_base     <- loo(fit_base, moment_match = TRUE)
+loo_wat_sex  <- loo(fit_wat_sex, moment_match = TRUE)
+loo_wat_diet <- loo(fit_wat_diet, moment_match = TRUE)
+loo_wat_full <- loo(fit_wat_full, moment_match = TRUE)
+
+loo_compare(
+  loo_base,
+  loo_wat_sex,
+  loo_wat_diet,
+  loo_wat_full
+)
+
+
+
+#IL6         elpd_diff se_diff
+#fit_wat_sex   0.0       0.0   
+#fit_wat_diet -0.4       1.8   
+#fit_base     -0.5       2.0   
+#fit_wat_full -1.1       1.1
+
+#Ghrelin      elpd_diff se_diff
+#fit_wat_sex   0.0       0.0   
+#fit_base     -0.2       1.4   
+#fit_wat_full -0.5       1.1   
+#fit_wat_diet -1.7       1.3  
+
+
+#Leptin       elpd_diff se_diff
+#fit_wat_sex   0.0       0.0   
+#fit_wat_full -0.7       1.6   
+#fit_wat_diet -1.1       1.8   
+#fit_base     -2.1       1.8  
+```
+
