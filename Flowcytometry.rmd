@@ -1,0 +1,1106 @@
+
+---
+title: "Flow_cytometry"
+author: "Sigri"
+date: "2023-04-26"
+output: html_document
+---
+
+# Load libraries
+```{r message=FALSE, warning=FALSE, paged.print=FALSE, results=hide}
+#####load libraries### 
+library(naniar)
+library(multcompView)
+library(rstatix)
+library(multcompView)
+library(readxl)
+library(tidyverse)
+library(ggpubr)
+library(ggbeeswarm)
+library(ggh4x)
+library(EnvStats)
+library(modelsummary)
+library(ggpmisc)
+library(sjPlot)
+library(brms)
+library(tidybayes)
+library(cmdstanr)
+library(tibble)
+library(stringr)
+library(tidyverse) 
+library(readr) 
+library(readxl)
+library(ggplot2)
+library(ggpubr)
+library(gridExtra)
+library(EnvStats)
+library(scales)
+library(egg)
+library(multcompView)
+library(rstatix)
+library(ggh4x)
+library(dplyr)
+library(tidyr)
+
+```
+
+# Import data 
+```{r import data}
+MS1_flow_df <- read_xlsx("MS1_flow_merged_results.xlsx", sheet = "final_samplesheet") %>%
+  filter(mouseID!="EO5.8_MR") %>% # something wrong with the WAT weight of this mouse
+  mutate(sex = factor(sex, levels = c("female", "male")))  # Change level order of sex
+```
+
+```{r add Hp loads}
+# Load Hp loads data
+MS1_Hp_loads <- read_xlsx("MS1_Hp_loads.xlsx") %>%
+  select(mouseID, Hp_copies_std) 
+
+# Add Hp loads to dataframe
+MS1_flow_df <- MS1_flow_df %>% 
+  inner_join(MS1_Hp_loads, by = "mouseID")
+
+
+MS1_flow_df <- MS1_flow_df %>%
+  
+  mutate(
+    
+    conc_log10_F480_CD11b = log10(F480_CD11b),
+    
+    Hp_copies_std_log10 = log10(Hp_copies_std)
+  )
+
+```
+
+# Macrophages
+```{r ATMs: plot}
+plot_ATMs <- MS1_flow_df %>% 
+  filter(type == "normalized_counts") %>%
+  ggplot(aes(x = treatment, y = log10(F480_CD11b), color = treatment, fill = treatment)) +
+  geom_boxplot(alpha = 0.1, outlier.shape = NA, lwd = 0.75, show.legend = FALSE) +
+  geom_jitter(height = 0, width = 0.2, size = 2) +
+  labs(y = expression(paste("log"[10], " (F4/80"^"+", phantom("+"), "CD11b"^"+", phantom("+"), "ATMs per g WAT)"))) +
+  theme_pubr(border = TRUE) +
+  scale_color_manual(values = c("Ctrl" = "#0072B2", "Hp" = "#E69F00"), 
+                     labels = c("Ctrl" = "Control", "Hp" = expression(italic("H. pylori")))) +
+  scale_fill_manual(values = c("Ctrl" = "#0072B2", "Hp" = "#E69F00"),
+                    labels = c("Ctrl" = "Control", "Hp" = expression(italic("H. pylori")))) +
+  facet_nested(~ sex + diet, 
+               nest_line = element_line(linetype = 1)) + 
+  scale_y_continuous(limits = c(3.4, 5.6), breaks = c(3.5, 4, 4.5, 5, 5.5)) +
+  stat_n_text(alpha = 0.75) + 
+  ggtitle("Adipose tissue macrophages (ATMs)") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(size = 12),
+        axis.title.x = element_blank(),
+        axis.text.y = element_text(size = 10), 
+        strip.text.x = element_text(size = 12), 
+        strip.text.y = element_text(size = 12), 
+        legend.position = "bottom", 
+        legend.title = element_blank(), 
+        legend.text = element_text(size = 12), 
+        legend.margin = margin(c(1, 5, 5, 5)), 
+        legend.spacing = unit(0.5, "cm"),
+        strip.background = element_blank(), 
+        ggh4x.facet.nestline = element_line(colour = "black"),
+        panel.border = element_rect(colour = "black", fill = NA, size = 0.75),
+        plot.title = element_text(hjust = 0.5, size = 12, face = "bold"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.spacing.x = unit(1, "lines")) + 
+    guides(color = guide_legend(override.aes = list(size = 5))) 
+        
+plot_ATMs
+```
+
+```{r}
+
+# --- 1. FIT MODEL ---
+df_macrophages_ATM <- MS1_flow_df %>%
+  filter(type == "normalized_counts") %>%
+  mutate(
+    treatment = factor(treatment, levels = c("Ctrl", "Hp")),
+    sex       = factor(sex, levels = c("female", "male")),
+    diet      = factor(diet, levels = c("CD", "HFD")),
+    type      = factor(type)
+  )
+
+# NOTE: Ensure F480_CD11b has no zeros before log10
+fit_macrophages <- brm(
+  log10(F480_CD11b) ~ treatment * sex * diet,
+  data = df_macrophages_ATM,
+  family = student(),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(student_t(3, 0, 1), class = "sigma")
+  ),
+  chains = 4, cores = 4, iter = 4000, warmup = 2000,
+  control = list(adapt_delta = 0.99),
+  seed = 123
+)
+
+# --- 2. PREDICTIONS ---
+newdata_mac <- expand_grid(
+  sex       = unique(df_macrophages_ATM$sex),
+  treatment = unique(df_macrophages_ATM$treatment),
+  diet      = unique(df_macrophages_ATM$diet)
+)
+
+preds_mac <- add_epred_draws(newdata_mac, fit_macrophages)
+
+# A. Main Effects (Pooled)
+eff_main_treat <- preds_mac %>%
+  group_by(sex, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = treatment, values_from = epred) %>%
+  mutate(effect = Hp - Ctrl) %>%
+  group_by(sex) %>%
+  summarise(
+    median    = median(effect),
+    CI95_low  = quantile(effect, 0.025),
+    CI95_high = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Main Effects", label = "Treatment")
+
+eff_main_diet <- preds_mac %>%
+  group_by(sex, diet, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = diet, values_from = epred) %>%
+  mutate(effect = HFD - CD) %>%
+  group_by(sex) %>%
+  summarise(
+    median    = median(effect),
+    CI95_low  = quantile(effect, 0.025),
+    CI95_high = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Main Effects", label = "Diet")
+
+# B. Interaction
+eff_interaction <- preds_mac %>%
+  group_by(sex, diet, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = c(treatment, diet), values_from = epred) %>%
+  mutate(effect = (Hp_HFD - Ctrl_HFD) - (Hp_CD - Ctrl_CD)) %>%
+  group_by(sex) %>%
+  summarise(
+    median    = median(effect),
+    CI95_low  = quantile(effect, 0.025),
+    CI95_high = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Interaction", label = "Interaction")
+
+# C. Simple Effects
+eff_simple_treat <- preds_mac %>%
+  group_by(sex, diet, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = treatment, values_from = epred) %>%
+  mutate(effect = Hp - Ctrl) %>%
+  group_by(sex, diet) %>%
+  summarise(
+    median    = median(effect),
+    CI95_low  = quantile(effect, 0.025),
+    CI95_high = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Simple Effects", label = paste("Treatment in", diet))
+
+eff_simple_diet <- preds_mac %>%
+  group_by(sex, diet, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = diet, values_from = epred) %>%
+  mutate(effect = HFD - CD) %>%
+  group_by(sex, treatment) %>%
+  summarise(
+    median    = median(effect),
+    CI95_low  = quantile(effect, 0.025),
+    CI95_high = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Simple Effects", label = paste("Diet in", treatment))
+
+# --- 4. COMBINE AND FORMAT ---
+plot_df_ATM <- bind_rows(
+  eff_main_treat, eff_main_diet, eff_interaction,
+  eff_simple_treat, eff_simple_diet
+) %>%
+  mutate(
+    biomarker = "ATMs (F4/80+ CD11b+) / g WAT",
+    label = factor(label, levels = c(
+      "Diet in Hp", "Diet in Ctrl",
+      "Treatment in HFD", "Treatment in CD",
+      "Interaction",
+      "Diet", "Treatment"
+    )),
+    type = factor(type, levels = c("Main Effects", "Interaction", "Simple Effects"))
+  )
+
+# --- 5. PLOT ---
+pd <- position_dodge(width = 0.6)
+
+ATM_plot <- ggplot(plot_df_ATM, aes(x = label, y = median, color = sex)) +
+
+  # 95% CI = thinner outer line
+  geom_linerange(
+    aes(ymin = CI95_low, ymax = CI95_high),
+    position = pd,
+    linewidth = 0.5
+  ) +
+
+  # 80% CI = thicker inner line
+  geom_linerange(
+    aes(ymin = CI80_low, ymax = CI80_high),
+    position = pd,
+    linewidth = 1.2
+  ) +
+
+  # Point estimate
+  geom_point(
+    aes(shape = type),
+    position = pd,
+    size = 2.2
+  ) +
+
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  facet_wrap(~ biomarker) +
+
+  scale_color_manual(values = c("female" = "#b19cd9", "male" = "#6a0dad")) +
+  scale_shape_manual(values = c(
+    "Main Effects"   = 16,
+    "Interaction"    = 18,
+    "Simple Effects" = 15
+  )) +
+
+  guides(
+    shape = guide_legend(order = 1),
+    color = guide_legend(order = 2)
+  ) +
+
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.text.y        = element_text(color = "black"),
+    strip.text         = element_text(face = "bold"),
+    legend.position    = "bottom",
+    legend.box         = "vertical",
+    legend.margin      = margin(t = 0, b = 0, unit = "pt")
+  ) +
+  labs(
+    x = "",
+    y = "Effect Estimate (Log10 Difference)",
+    color = "Sex",
+    shape = "Effect Type"
+  )
+
+ggsave("ATM_effects_log10.pdf", plot = ATM_plot, width = 6, height = 5, units = "in")
+
+ATM_plot
+
+```
+
+
+
+# M2 macrophages
+```{r M2: plot data}
+plot_CD301 <- MS1_flow_df %>% 
+  filter(type=="freq_of_parent") %>%
+  ggplot(aes(x = treatment, y = `CD301`, color = treatment, fill = treatment)) +
+  geom_boxplot(alpha = 0.1, outlier.shape = NA, lwd = 0.75, show.legend = FALSE) +
+  geom_jitter(height = 0, width = 0.2, size = 2) +
+  labs(y = expression("% CD301"^"+"*phantom("+")*"(M2) of ATMs")) + 
+  theme_pubr(border = TRUE) +
+  scale_color_manual(values = c("Ctrl" = "#0072B2", "Hp" = "#E69F00"), 
+                     labels = c("Ctrl" = "Control", "Hp" = expression(italic("H. pylori")))) +
+  scale_fill_manual(values = c("Ctrl" = "#0072B2", "Hp" = "#E69F00"),
+                    labels = c("Ctrl" = "Control", "Hp" = expression(italic("H. pylori")))) +
+  facet_nested(~ sex + diet, 
+               nest_line = element_line(linetype = 1)) + 
+  scale_y_continuous(limits = c(29, 71), breaks = c(30, 40, 50, 60 , 70)) +
+  stat_n_text(alpha = 0.75, y.pos = 29) + 
+  ggtitle("M2 macrophages") + 
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(size = 12),
+        axis.title.x = element_blank(),
+        axis.text.y = element_text(size = 10), 
+        strip.text.x = element_text(size = 12), 
+        strip.text.y = element_text(size = 12), 
+        legend.position = "bottom", 
+        legend.title = element_blank(), 
+        legend.text = element_text(size = 12), 
+        legend.margin = margin(c(1, 5, 5, 5)), 
+        legend.spacing = unit(0.5, "cm"),
+        strip.background = element_blank(), 
+        ggh4x.facet.nestline = element_line(colour = "black"),
+        panel.border = element_rect(colour = "black", fill = NA, size = 0.75),
+        plot.title = element_text(hjust = 0.5, size = 12, face = "bold"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.spacing.x = unit(1, "lines")) + 
+    guides(color = guide_legend(override.aes = list(size = 5))) 
+plot_CD301
+```
+
+```{r}
+
+# --- 1. FIT MODEL ---
+df_macrophages_M2 <- MS1_flow_df %>%
+  filter(type == "freq_of_parent") %>%
+  mutate(
+    treatment = factor(treatment, levels = c("Ctrl", "Hp")),
+    sex       = factor(sex, levels = c("female", "male")),
+    diet      = factor(diet, levels = c("CD", "HFD")),
+    type      = factor(type)
+  )
+
+fit_M2 <- brm(
+  CD301 ~ treatment * sex * diet,
+  data = df_macrophages_M2,
+  family = student(),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(student_t(3, 0, 1), class = "sigma")
+  ),
+  chains = 4, cores = 4, iter = 4000, warmup = 2000,
+  control = list(adapt_delta = 0.99),
+  seed = 123
+)
+
+# --- 2. PREDICTIONS ---
+newdata_mac2 <- expand_grid(
+  sex       = unique(df_macrophages_M2$sex),
+  treatment = unique(df_macrophages_M2$treatment),
+  diet      = unique(df_macrophages_M2$diet)
+)
+
+preds_M2 <- add_epred_draws(newdata_mac2, fit_M2)
+
+# --- 3. CALCULATE EFFECTS (Standardized) ---
+
+# A. Main Effects (Pooled)
+eff_main_treat <- preds_M2 %>%
+  group_by(sex, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = treatment, values_from = epred) %>%
+  mutate(effect = Hp - Ctrl) %>%
+  group_by(sex) %>%
+  summarise(
+    median    = median(effect),
+    CI95_low  = quantile(effect, 0.025),
+    CI95_high = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Main Effects", label = "Treatment")
+
+eff_main_diet <- preds_M2 %>%
+  group_by(sex, diet, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = diet, values_from = epred) %>%
+  mutate(effect = HFD - CD) %>%
+  group_by(sex) %>%
+  summarise(
+    median    = median(effect),
+    CI95_low  = quantile(effect, 0.025),
+    CI95_high = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Main Effects", label = "Diet")
+
+# B. Interaction
+eff_interaction <- preds_M2 %>%
+  group_by(sex, diet, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = c(treatment, diet), values_from = epred) %>%
+  mutate(effect = (Hp_HFD - Ctrl_HFD) - (Hp_CD - Ctrl_CD)) %>%
+  group_by(sex) %>%
+  summarise(
+    median    = median(effect),
+    CI95_low  = quantile(effect, 0.025),
+    CI95_high = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Interaction", label = "Interaction")
+
+# C. Simple Effects
+eff_simple_treat <- preds_M2 %>%
+  group_by(sex, diet, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = treatment, values_from = epred) %>%
+  mutate(effect = Hp - Ctrl) %>%
+  group_by(sex, diet) %>%
+  summarise(
+    median    = median(effect),
+    CI95_low  = quantile(effect, 0.025),
+    CI95_high = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Simple Effects", label = paste("Treatment in", diet))
+
+eff_simple_diet <- preds_M2 %>%
+  group_by(sex, diet, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = diet, values_from = epred) %>%
+  mutate(effect = HFD - CD) %>%
+  group_by(sex, treatment) %>%
+  summarise(
+    median    = median(effect),
+    CI95_low  = quantile(effect, 0.025),
+    CI95_high = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Simple Effects", label = paste("Diet in", treatment))
+
+# --- 4. COMBINE AND FORMAT ---
+plot_df_M2 <- bind_rows(
+  eff_main_treat, eff_main_diet, eff_interaction,
+  eff_simple_treat, eff_simple_diet
+) %>%
+  mutate(
+    biomarker = "M2 Macrophages (CD301+)",
+    label = factor(label, levels = c(
+      "Diet in Hp", "Diet in Ctrl",
+      "Treatment in HFD", "Treatment in CD",
+      "Interaction",
+      "Diet", "Treatment"
+    )),
+    type = factor(type, levels = c("Main Effects", "Interaction", "Simple Effects"))
+  )
+
+# --- 5. PLOT ---
+pd <- position_dodge(width = 0.6)
+
+M2_plot <- ggplot(plot_df_M2, aes(x = label, y = median, color = sex)) +
+
+  # 95% CI = thin outer line
+  geom_linerange(
+    aes(ymin = CI95_low, ymax = CI95_high),
+    position = pd,
+    linewidth = 0.5
+  ) +
+
+  # 80% CI = thick inner line
+  geom_linerange(
+    aes(ymin = CI80_low, ymax = CI80_high),
+    position = pd,
+    linewidth = 1.2
+  ) +
+
+  # point estimate
+  geom_point(
+    aes(shape = type),
+    position = pd,
+    size = 2.2
+  ) +
+
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  facet_wrap(~ biomarker) +
+
+  scale_color_manual(values = c("female" = "#b19cd9", "male" = "#6a0dad")) +
+  scale_shape_manual(values = c(
+    "Main Effects"   = 16,
+    "Interaction"    = 18,
+    "Simple Effects" = 15
+  )) +
+
+  guides(
+    shape = guide_legend(order = 1),
+    color = guide_legend(order = 2)
+  ) +
+
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.text.y        = element_text(color = "black"),
+    strip.text         = element_text(face = "bold"),
+    legend.position    = "bottom",
+    legend.box         = "vertical",
+    legend.margin      = margin(t = 0, b = 0, unit = "pt")
+  ) +
+  labs(
+    x = "",
+    y = "Effect Estimate (% CD301 Difference)",
+    color = "Sex",
+    shape = "Effect Type"
+  )
+
+ggsave("M2_macrophage_effects.pdf", plot = M2_plot, width = 6, height = 5, units = "in")
+
+M2_plot
+
+```
+
+
+
+ 
+# M1 macrophages
+```{r M1: plot data}
+plot_CD11c <- MS1_flow_df %>% 
+  filter(type=="freq_of_parent") %>%
+  ggplot(aes(x = treatment, y = `CD11c`, color = treatment, fill = treatment)) +
+  geom_boxplot(alpha = 0.1, outlier.shape = NA, lwd = 0.75, show.legend = FALSE) +
+  geom_jitter(height = 0, width = 0.2, size = 2) +
+  labs(y = expression("% CD11c"^"+"*phantom("+")*"(M1) of ATMs")) + 
+  theme_pubr(border = TRUE) +
+  scale_color_manual(values = c("Ctrl" = "#0072B2", "Hp" = "#E69F00"), 
+                     labels = c("Ctrl" = "Control", "Hp" = expression(italic("H. pylori")))) +
+  scale_fill_manual(values = c("Ctrl" = "#0072B2", "Hp" = "#E69F00"),
+                    labels = c("Ctrl" = "Control", "Hp" = expression(italic("H. pylori")))) +
+  facet_nested(~ sex + diet, 
+               nest_line = element_line(linetype = 1)) + 
+  scale_y_continuous(limits = c(7, 21), breaks = c(8, 12, 16, 20)) +
+  stat_n_text(alpha = 0.75, y.pos = 7) + 
+  ggtitle("M1 macrophages") + 
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(size = 12),
+        axis.title.x = element_blank(),
+        axis.text.y = element_text(size = 10), 
+        strip.text.x = element_text(size = 12), 
+        strip.text.y = element_text(size = 12), 
+        legend.position = "bottom", 
+        legend.title = element_blank(), 
+        legend.text = element_text(size = 12), 
+        legend.margin = margin(c(1, 5, 5, 5)), 
+        legend.spacing = unit(0.5, "cm"),
+        strip.background = element_blank(), 
+        ggh4x.facet.nestline = element_line(colour = "black"),
+        panel.border = element_rect(colour = "black", fill = NA, size = 0.75),
+        plot.title = element_text(hjust = 0.5, size = 12, face = "bold"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.spacing.x = unit(1, "lines")) + 
+    guides(color = guide_legend(override.aes = list(size = 5))) 
+plot_CD11c
+```
+
+
+```{r}
+
+# --- 1. FIT MODEL  ---
+df_macrophages_M1 <- MS1_flow_df %>%
+  filter(type == "freq_of_parent") %>%
+  mutate(
+    treatment = factor(treatment, levels = c("Ctrl", "Hp")),
+    sex       = factor(sex, levels = c("female", "male")),
+    diet      = factor(diet, levels = c("CD", "HFD")),
+    type      = factor(type)
+  )
+
+fit_M1 <- brm(
+  CD11c ~ treatment * sex * diet,
+  data = df_macrophages_M1,
+  family = student(),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(student_t(3, 0, 1), class = "sigma")
+  ),
+  chains = 4, cores = 4, iter = 4000, warmup = 2000,
+  control = list(adapt_delta = 0.99),
+  seed = 123
+)
+
+# --- 2. PREDICTIONS ---
+newdata_mac1 <- expand_grid(
+  sex       = unique(df_macrophages_M1$sex),
+  treatment = unique(df_macrophages_M1$treatment),
+  diet      = unique(df_macrophages_M1$diet)
+)
+
+preds_M1 <- add_epred_draws(newdata_mac1, fit_M1)
+
+# --- 3. CALCULATE EFFECTS ---
+
+# A. Main Effects (Pooled)
+eff_main_treat <- preds_M1 %>%
+  group_by(sex, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = treatment, values_from = epred) %>%
+  mutate(effect = Hp - Ctrl) %>%
+  group_by(sex) %>%
+  summarise(
+    median    = median(effect),
+    CI95_low  = quantile(effect, 0.025),
+    CI95_high = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Main Effects", label = "Treatment")
+
+eff_main_diet <- preds_M1 %>%
+  group_by(sex, diet, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = diet, values_from = epred) %>%
+  mutate(effect = HFD - CD) %>%
+  group_by(sex) %>%
+  summarise(
+    median    = median(effect),
+    CI95_low  = quantile(effect, 0.025),
+    CI95_high = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Main Effects", label = "Diet")
+
+# B. Interaction
+eff_interaction <- preds_M1 %>%
+  group_by(sex, diet, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = c(treatment, diet), values_from = epred) %>%
+  mutate(effect = (Hp_HFD - Ctrl_HFD) - (Hp_CD - Ctrl_CD)) %>%
+  group_by(sex) %>%
+  summarise(
+    median    = median(effect),
+    CI95_low  = quantile(effect, 0.025),
+    CI95_high = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Interaction", label = "Interaction")
+
+# C. Simple Effects
+eff_simple_treat <- preds_M1 %>%
+  group_by(sex, diet, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = treatment, values_from = epred) %>%
+  mutate(effect = Hp - Ctrl) %>%
+  group_by(sex, diet) %>%
+  summarise(
+    median    = median(effect),
+    CI95_low  = quantile(effect, 0.025),
+    CI95_high = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Simple Effects", label = paste("Treatment in", diet))
+
+eff_simple_diet <- preds_M1 %>%
+  group_by(sex, diet, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = diet, values_from = epred) %>%
+  mutate(effect = HFD - CD) %>%
+  group_by(sex, treatment) %>%
+  summarise(
+    median    = median(effect),
+    CI95_low  = quantile(effect, 0.025),
+    CI95_high = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Simple Effects", label = paste("Diet in", treatment))
+
+# --- 4. COMBINE AND FORMAT ---
+plot_df_M1 <- bind_rows(
+  eff_main_treat, eff_main_diet, eff_interaction,
+  eff_simple_treat, eff_simple_diet
+) %>%
+  mutate(
+    biomarker = "M1 Macrophages (CD11c+)",
+    label = factor(label, levels = c(
+      "Diet in Hp", "Diet in Ctrl",
+      "Treatment in HFD", "Treatment in CD",
+      "Interaction",
+      "Diet", "Treatment"
+    )),
+    type = factor(type, levels = c("Main Effects", "Interaction", "Simple Effects"))
+  )
+
+# --- 5. PLOT ---
+pd <- position_dodge(width = 0.6)
+
+M1_plot <- ggplot(plot_df_M1, aes(x = label, y = median, color = sex)) +
+
+  # 95% CI = thin outer line
+  geom_linerange(
+    aes(ymin = CI95_low, ymax = CI95_high),
+    position = pd,
+    linewidth = 0.5
+  ) +
+
+  # 80% CI = thick inner line
+  geom_linerange(
+    aes(ymin = CI80_low, ymax = CI80_high),
+    position = pd,
+    linewidth = 1.2
+  ) +
+
+  # Point estimate
+  geom_point(
+    aes(shape = type),
+    position = pd,
+    size = 2.2
+  ) +
+
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  facet_wrap(~ biomarker) +
+
+  scale_color_manual(values = c("female" = "#b19cd9", "male" = "#6a0dad")) +
+  scale_shape_manual(values = c(
+    "Main Effects"   = 16,
+    "Interaction"    = 18,
+    "Simple Effects" = 15
+  )) +
+
+  guides(
+    shape = guide_legend(order = 1),
+    color = guide_legend(order = 2)
+  ) +
+
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.text.y        = element_text(color = "black"),
+    strip.text         = element_text(face = "bold"),
+    legend.position    = "bottom",
+    legend.box         = "vertical",
+    legend.margin      = margin(t = 0, b = 0, unit = "pt")
+  ) +
+  labs(
+    x = "",
+    y = "Effect Estimate (% CD11c Difference)",
+    color = "Sex",
+    shape = "Effect Type"
+  )
+
+ggsave("M1_macrophage_effects.pdf", plot = M1_plot, width = 6, height = 5, units = "in")
+
+M1_plot
+
+```
+
+
+
+
+
+# M1/M2 ratio
+```{r M1/M2: plot data}
+plot_ratio <- MS1_flow_df %>% 
+  filter(type=="counts") %>%
+  mutate(ratio = (CD11c/CD301)) %>%
+  ggplot(aes(x = treatment, y = `ratio`, color = treatment, fill = treatment)) +
+  geom_boxplot(alpha = 0.1, outlier.shape = NA, lwd = 0.75, show.legend = FALSE) +
+  geom_jitter(height = 0, width = 0.2, size = 2) +
+  labs(y = "M1/M2 ratio") + 
+  theme_pubr(border = TRUE) +
+  scale_color_manual(values = c("Ctrl" = "#0072B2", "Hp" = "#E69F00"), 
+                     labels = c("Ctrl" = "Control", "Hp" = expression(italic("H. pylori")))) +
+  scale_fill_manual(values = c("Ctrl" = "#0072B2", "Hp" = "#E69F00"),
+                    labels = c("Ctrl" = "Control", "Hp" = expression(italic("H. pylori")))) +
+  facet_nested(~ sex + diet, 
+               nest_line = element_line(linetype = 1)) + 
+  scale_y_continuous(limits = c(0.1, 0.6), breaks = c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6)) +
+  stat_n_text(alpha = 0.75, y.pos = 0.1) + 
+  ggtitle("M1/M2 ratio") + 
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(size = 12),
+        axis.title.x = element_blank(),
+        axis.text.y = element_text(size = 10), 
+        strip.text.x = element_text(size = 12), 
+        strip.text.y = element_text(size = 12), 
+        legend.position = "bottom", 
+        legend.title = element_blank(), 
+        legend.text = element_text(size = 12), 
+        legend.margin = margin(c(1, 5, 5, 5)), 
+        legend.spacing = unit(0.5, "cm"),
+        strip.background = element_blank(), 
+        ggh4x.facet.nestline = element_line(colour = "black"),
+        panel.border = element_rect(colour = "black", fill = NA, size = 0.75),
+        plot.title = element_text(hjust = 0.5, size = 12, face = "bold"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.spacing.x = unit(1, "lines")) + 
+    guides(color = guide_legend(override.aes = list(size = 5))) 
+plot_ratio
+```
+
+```{r}
+
+# --- 1. FIT MODEL (Unchanged) ---
+df_macrophages_ratio <- MS1_flow_df %>%
+  filter(type == "counts") %>%
+  mutate(ratio = (CD11c / CD301)) %>%
+  mutate(
+    treatment = factor(treatment, levels = c("Ctrl", "Hp")),
+    sex       = factor(sex, levels = c("female", "male")),
+    diet      = factor(diet, levels = c("CD", "HFD")),
+    type      = factor(type)
+  )
+
+fit_ratio <- brm(
+  ratio ~ treatment * sex * diet,
+  data = df_macrophages_ratio,
+  family = student(),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(student_t(3, 0, 1), class = "sigma")
+  ),
+  chains = 4, cores = 4, iter = 4000, warmup = 2000,
+  control = list(adapt_delta = 0.99),
+  seed = 123
+)
+
+# --- 2. PREDICTIONS ---
+newdata_ratio <- expand_grid(
+  sex       = unique(df_macrophages_ratio$sex),
+  treatment = unique(df_macrophages_ratio$treatment),
+  diet      = unique(df_macrophages_ratio$diet)
+)
+
+preds_ratio <- add_epred_draws(newdata_ratio, fit_ratio)
+
+# --- 3. CALCULATE EFFECTS (Difference in Ratios) ---
+
+# A. Main Effects (Pooled)
+eff_main_treat <- preds_ratio %>%
+  group_by(sex, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = treatment, values_from = epred) %>%
+  mutate(effect = Hp - Ctrl) %>%
+  group_by(sex) %>%
+  summarise(
+    median    = median(effect),
+    CI95_low  = quantile(effect, 0.025),
+    CI95_high = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Main Effects", label = "Treatment")
+
+eff_main_diet <- preds_ratio %>%
+  group_by(sex, diet, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = diet, values_from = epred) %>%
+  mutate(effect = HFD - CD) %>%
+  group_by(sex) %>%
+  summarise(
+    median    = median(effect),
+    CI95_low  = quantile(effect, 0.025),
+    CI95_high = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Main Effects", label = "Diet")
+
+# B. Interaction
+eff_interaction <- preds_ratio %>%
+  group_by(sex, diet, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = c(treatment, diet), values_from = epred) %>%
+  mutate(effect = (Hp_HFD - Ctrl_HFD) - (Hp_CD - Ctrl_CD)) %>%
+  group_by(sex) %>%
+  summarise(
+    median    = median(effect),
+    CI95_low  = quantile(effect, 0.025),
+    CI95_high = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Interaction", label = "Interaction")
+
+# C. Simple Effects
+eff_simple_treat <- preds_ratio %>%
+  group_by(sex, diet, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = treatment, values_from = epred) %>%
+  mutate(effect = Hp - Ctrl) %>%
+  group_by(sex, diet) %>%
+  summarise(
+    median    = median(effect),
+    CI95_low  = quantile(effect, 0.025),
+    CI95_high = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Simple Effects", label = paste("Treatment in", diet))
+
+eff_simple_diet <- preds_ratio %>%
+  group_by(sex, diet, treatment, .draw) %>%
+  summarise(epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = diet, values_from = epred) %>%
+  mutate(effect = HFD - CD) %>%
+  group_by(sex, treatment) %>%
+  summarise(
+    median    = median(effect),
+    CI95_low  = quantile(effect, 0.025),
+    CI95_high = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups   = "drop"
+  ) %>%
+  mutate(type = "Simple Effects", label = paste("Diet in", treatment))
+
+# --- 4. COMBINE AND FORMAT ---
+plot_df_ratio <- bind_rows(
+  eff_main_treat, eff_main_diet, eff_interaction,
+  eff_simple_treat, eff_simple_diet
+) %>%
+  mutate(
+    biomarker = "M1/M2 Ratio",
+    label = factor(label, levels = c(
+      "Diet in Hp", "Diet in Ctrl",
+      "Treatment in HFD", "Treatment in CD",
+      "Interaction",
+      "Diet", "Treatment"
+    )),
+    type = factor(type, levels = c("Main Effects", "Interaction", "Simple Effects"))
+  )
+
+# --- 5. PLOT ---
+pd <- position_dodge(width = 0.6)
+
+Ratio_plot <- ggplot(plot_df_ratio, aes(x = label, y = median, color = sex)) +
+
+  # 95% CI = thin outer line
+  geom_linerange(
+    aes(ymin = CI95_low, ymax = CI95_high),
+    position = pd,
+    linewidth = 0.5
+  ) +
+
+  # 80% CI = thick inner line
+  geom_linerange(
+    aes(ymin = CI80_low, ymax = CI80_high),
+    position = pd,
+    linewidth = 1.2
+  ) +
+
+  # Point estimate
+  geom_point(
+    aes(shape = type),
+    position = pd,
+    size = 2.2
+  ) +
+
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  facet_wrap(~ biomarker) +
+
+  scale_color_manual(values = c("female" = "#b19cd9", "male" = "#6a0dad")) +
+  scale_shape_manual(values = c(
+    "Main Effects"   = 16,
+    "Interaction"    = 18,
+    "Simple Effects" = 15
+  )) +
+
+  guides(
+    shape = guide_legend(order = 1),
+    color = guide_legend(order = 2)
+  ) +
+
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.text.y        = element_text(color = "black"),
+    strip.text         = element_text(face = "bold"),
+    legend.position    = "bottom",
+    legend.box         = "vertical",
+    legend.margin      = margin(t = 0, b = 0, unit = "pt")
+  ) +
+  labs(
+    x = "",
+    y = "Effect Estimate (Difference in Ratio)",
+    color = "Sex",
+    shape = "Effect Type"
+  )
+
+# Save
+ggsave("Macrophage_Ratio_effects.pdf", plot = Ratio_plot, width = 6, height = 5, units = "in")
+
+Ratio_plot
+```
+
+```{r}
+# 2. Combine plots with Labels
+
+library(patchwork)
+library(ggplot2)
+
+# remove y-axis for right-column panels (B and D)
+drop_y <- function(p) {
+  p + theme(
+    axis.title.y = element_blank(),
+    axis.text.y  = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+}
+
+# compact combined legend (Sex + Effect type stacked)
+compact_leg <- function(p) {
+  p +
+    guides(
+      shape = guide_legend(order = 1, nrow = 1),
+      color = guide_legend(order = 2, nrow = 1)
+    ) +
+    theme(
+      legend.position = "bottom",
+      legend.box      = "vertical"
+    )
+}
+
+# A,C keep y-axis; B,D drop y-axis
+pA <- ATM_plot
+pB <- drop_y(M1_plot)
+pC <- M2_plot
+pD <- drop_y(Ratio_plot)
+
+# keep legends only in ONE panel (D) so patchwork can collect them once
+pA <- pA + theme(legend.position = "none")
+pB <- pB + theme(legend.position = "none")
+pC <- pC + theme(legend.position = "none")
+pD <- compact_leg(pD)  # legend kept here
+
+# 2x2 layout: (A B) / (C D)
+flow_plot_2x2 <- (pA | pB) / (pC | pD) +
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = "A") &
+  theme(
+    plot.tag = element_text(size = 16, face = "bold"),
+    legend.position = "bottom"
+  )
+
+flow_plot_2x2
+
+ggsave("flow_plot_2x2.jpeg", plot = flow_plot_2x2,
+       width = 9, height = 8, units = "in")
+
+```
+
