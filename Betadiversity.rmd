@@ -16,6 +16,7 @@ library(tidybayes)
 library(forcats)
 library(brms)
 library(patchwork)
+library(cmdstanr)
 ```
 
 # Load phyloseq objects
