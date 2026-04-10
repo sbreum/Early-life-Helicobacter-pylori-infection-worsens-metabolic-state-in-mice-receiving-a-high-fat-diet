@@ -19,6 +19,7 @@ library(ggplot2)
 library(purrr)
 library(cowplot)
 library(loo)
+library(patchwork)
 ```
 
 # Import data
@@ -1701,3 +1702,919 @@ loo_compare(
 #fit_base     -2.1       1.8  
 ```
 
+
+```{r}
+
+MSD_noNAs_df <- MSD_noNAs_df %>%
+  mutate(treatment_diet = paste(treatment, diet, sep = "_"))
+```
+
+
+
+
+
+```{r}
+#plot IL6 during full experiment
+
+# Filter and summarize data for ST experiment
+MSD_noNAs_df_IL6 <- MSD_noNAs_df %>%
+  filter(biomarker == "IL6") %>%
+  group_by(days_on_diet, sex, treatment_diet) %>%
+  summarize(median_IL6 = median(conc_log10), SD_IL6 = sd(conc_log10), .groups = 'drop')
+
+#colorscale for geom_point D-3
+point_data <- filter(MSD_noNAs_df_IL6, 
+                     treatment_diet %in% c("Hp_chow", "Ctrl_chow") & days_on_diet == -3) %>%
+  mutate(point_color = case_when(
+    treatment_diet == "Hp_chow" ~ "#E69F00",
+    treatment_diet == "Ctrl_chow" ~ "#0072B2"
+  ))
+
+
+IL6_trajectories <- ggplot() +
+  annotate("rect", xmin = 16.8, xmax = Inf, ymin = -Inf, ymax = Inf,
+           fill = "lightgrey", alpha = 0.2) +
+  
+
+  annotate("rect", xmin = -Inf, xmax = 2.9, ymin = -Inf, ymax = Inf,
+           fill = "lightgrey", alpha = 0.2) +
+  geom_line(data = filter(MSD_noNAs_df, biomarker == "IL6"), aes(x = days_on_diet, y = conc_log10, color = treatment_diet, group = mouseID), alpha = 0.3, size = 0.5) +
+  geom_line(data = MSD_noNAs_df_IL6, aes(x = days_on_diet, y = median_IL6, color = treatment_diet, linetype=treatment_diet), size = 1) +
+  
+  geom_point(
+  data = point_data,
+  aes(x = days_on_diet, y = median_IL6),
+  color = point_data$point_color,
+  size = 3,
+  shape = 16,
+  show.legend = FALSE)+
+  
+  xlab("Time (days)") +
+  ylab(expression(paste("log"[10],"(IL-6 pg/mL)")))  +
+  facet_wrap(~sex, scales = "free_x") +
+  scale_color_manual(
+    labels = c(
+      expression("Control + CD"),
+      expression("Control + HFD"),
+      expression(italic("H. pylori") * " + CD"),
+      expression(italic("H. pylori") * " + HFD")),
+    values = c(
+      "Ctrl_CD" = "#0072B2",
+      "Ctrl_HFD" = "#0072B2",
+      "Hp_CD" = "#E69F00",
+      "Hp_HFD" = "#E69F00")) +
+  scale_linetype_manual(
+    labels = c(
+      expression("Control + CD"),
+      expression("Control + HFD"),
+      expression(italic("H. pylori") * " + CD"),
+      expression(italic("H. pylori") * " + HFD")),
+    values = c(
+      "Ctrl_CD" = "dotted",
+      "Ctrl_HFD" = "solid",
+      "Hp_CD" = "dotted",
+      "Hp_HFD" = "solid")) + 
+  scale_x_continuous(expand = c(0, 0)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 10),
+        axis.title.y = element_text(size = 12),
+        axis.title.x = element_text(size = 12),
+        axis.text.y = element_text(size = 10),
+        strip.text.x = element_text(size = 12),
+        strip.text.y = element_text(size = 12),
+        legend.position = "bottom", 
+        legend.title = element_blank(), 
+        legend.text = element_text(size = 10), 
+        legend.key.height = unit(0.5, 'cm'),
+        legend.key.width = unit(1, 'cm'),
+        legend.key = element_rect(size = 0.75), 
+        legend.background = element_rect(color = "black", size = 0.5),
+        strip.background = element_blank(), 
+        panel.border = element_rect(colour = "black", fill=NA, size=0.75),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.spacing.x = unit(1, "lines")
+        ) + 
+    guides(color = guide_legend(nrow = 2, byrow = TRUE)) 
+
+# Display the plot
+IL6_trajectories
+
+
+
+
+```
+
+```{r}
+
+# Filter and summarize data for ST experiment
+MSD_noNAs_df_Ghrelin <- MSD_noNAs_df %>%
+  filter(biomarker == "Ghrelin") %>%
+  group_by(days_on_diet, sex, treatment_diet) %>%
+  summarize(median_Ghrl = median(conc_log10, na.rm = TRUE),
+            SD_Ghrl = sd(conc_log10, na.rm = TRUE),
+            .groups = 'drop')
+
+#colorscale for geom_point D-3
+point_data <- filter(MSD_noNAs_df_Ghrelin, 
+                     treatment_diet %in% c("Hp_chow", "Ctrl_chow") & days_on_diet == -3) %>%
+  mutate(point_color = case_when(
+    treatment_diet == "Hp_chow" ~ "#E69F00",
+    treatment_diet == "Ctrl_chow" ~ "#0072B2"
+  ))
+
+
+
+Ghrelin_trajectories <- ggplot() +
+  annotate("rect", xmin = 16.8, xmax = Inf, ymin = -Inf, ymax = Inf,
+           fill = "lightgrey", alpha = 0.2) +
+  
+
+  annotate("rect", xmin = -Inf, xmax = 2.9, ymin = -Inf, ymax = Inf,
+           fill = "lightgrey", alpha = 0.2) +
+  
+  geom_line(data = filter(MSD_noNAs_df, biomarker == "Ghrelin"), aes(x = days_on_diet, y = conc_log10, color = treatment_diet, group = mouseID), alpha = 0.3, size = 0.5) +
+  geom_line(data = MSD_noNAs_df_Ghrelin, aes(x = days_on_diet, y = median_Ghrl, color = treatment_diet, linetype=treatment_diet), size = 1) +
+  
+  geom_point(
+  data = point_data,
+  aes(x = days_on_diet, y = median_Ghrl),
+  color = point_data$point_color,
+  size = 3,
+  shape = 16,
+  show.legend = FALSE)+
+  
+  xlab("Time (days)") +
+  ylab(expression(paste("log"[10],"(Ghrelin pg/mL)")))  +
+  facet_wrap(~sex, scales = "free_x") +
+  scale_color_manual(
+    labels = c(
+      expression("Control + CD"),
+      expression("Control + HFD"),
+      expression(italic("H. pylori") * " + CD"),
+      expression(italic("H. pylori") * " + HFD")),
+    values = c(
+      "Ctrl_CD" = "#0072B2",
+      "Ctrl_HFD" = "#0072B2",
+      "Hp_CD" = "#E69F00",
+      "Hp_HFD" = "#E69F00")) +
+  scale_linetype_manual(
+    labels = c(
+      expression("Control + CD"),
+      expression("Control + HFD"),
+      expression(italic("H. pylori") * " + CD"),
+      expression(italic("H. pylori") * " + HFD")),
+    values = c(
+      "Ctrl_CD" = "dotted",
+      "Ctrl_HFD" = "solid",
+      "Hp_CD" = "dotted",
+      "Hp_HFD" = "solid")) + 
+  scale_x_continuous(expand = c(0, 0)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 10),
+        axis.title.y = element_text(size = 12),
+        axis.title.x = element_text(size = 12),
+        axis.text.y = element_text(size = 10),
+        strip.text.x = element_text(size = 12),
+        strip.text.y = element_text(size = 12),
+        legend.position = "bottom", 
+        legend.title = element_blank(), 
+        legend.text = element_text(size = 10), 
+        legend.key.height = unit(0.5, 'cm'),
+        legend.key.width = unit(1, 'cm'),
+        legend.key = element_rect(size = 0.75), 
+        legend.background = element_rect(color = "black", size = 0.5),
+        strip.background = element_blank(), 
+        panel.border = element_rect(colour = "black", fill=NA, size=0.75),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.spacing.x = unit(1, "lines")
+        ) + 
+    guides(color = guide_legend(nrow = 2, byrow = TRUE)) 
+
+# Display the plot
+Ghrelin_trajectories
+
+
+
+```
+
+
+
+```{r}
+
+
+# Filter and summarize data for ST experiment
+MSD_noNAs_df_Leptin <- MSD_noNAs_df %>%
+  filter(biomarker == "Leptin") %>%
+  group_by(days_on_diet, sex, treatment_diet) %>%
+  summarize(median_Lep = median(conc_log10, na.rm = TRUE),
+            SD_Lep = sd(conc_log10, na.rm = TRUE),
+            .groups = 'drop')
+
+
+#colorscale for geom_point D-3
+point_data <- filter(MSD_noNAs_df_Leptin, 
+                     treatment_diet %in% c("Hp_chow", "Ctrl_chow") & days_on_diet == -3) %>%
+  mutate(point_color = case_when(
+    treatment_diet == "Hp_chow" ~ "#E69F00",
+    treatment_diet == "Ctrl_chow" ~ "#0072B2"
+  ))
+
+
+ 
+
+Leptin_trajectories <- ggplot() +
+  annotate("rect", xmin = 16.8, xmax = Inf, ymin = -Inf, ymax = Inf,
+           fill = "lightgrey", alpha = 0.2) +
+  
+
+  annotate("rect", xmin = -Inf, xmax = 2.9, ymin = -Inf, ymax = Inf,
+           fill = "lightgrey", alpha = 0.2) +
+  
+  geom_line(data = filter(MSD_noNAs_df, biomarker == "Leptin"), aes(x = days_on_diet, y = conc_log10, color = treatment_diet, group = mouseID), alpha = 0.3, size = 0.5) +
+  
+  geom_line(data = MSD_noNAs_df_Leptin, aes(x = days_on_diet, y = median_Lep, color = treatment_diet, linetype=treatment_diet), size = 1) +
+  
+  geom_point(
+  data = point_data,
+  aes(x = days_on_diet, y = median_Lep),
+  color = point_data$point_color,
+  size = 3,
+  shape = 16,
+  show.legend = FALSE)+
+  
+  xlab("Time (days)") +
+ylab(expression(paste("log"[10],"(Leptin pg/mL)")))  +
+  facet_wrap(~sex, scales = "free_x") +
+  scale_color_manual(
+    labels = c(
+      expression("Control + CD"),
+      expression("Control + HFD"),
+      expression(italic("H. pylori") * " + CD"),
+      expression(italic("H. pylori") * " + HFD")),
+    values = c(
+      "Ctrl_CD" = "#0072B2",
+      "Ctrl_HFD" = "#0072B2",
+      "Hp_CD" = "#E69F00",
+      "Hp_HFD" = "#E69F00")) +
+  scale_linetype_manual(
+    labels = c(
+      expression("Control + CD"),
+      expression("Control + HFD"),
+      expression(italic("H. pylori") * " + CD"),
+      expression(italic("H. pylori") * " + HFD")),
+    values = c(
+      "Ctrl_CD" = "dotted",
+      "Ctrl_HFD" = "solid",
+      "Hp_CD" = "dotted",
+      "Hp_HFD" = "solid")) + 
+  scale_x_continuous(expand = c(0, 0)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 10),
+        axis.title.y = element_text(size = 12),
+        axis.title.x = element_text(size = 12),
+        axis.text.y = element_text(size = 10),
+        strip.text.x = element_text(size = 12),
+        strip.text.y = element_text(size = 12),
+        legend.position = "bottom", 
+        legend.title = element_blank(), 
+        legend.text = element_text(size = 10), 
+        legend.key.height = unit(0.5, 'cm'),
+        legend.key.width = unit(1, 'cm'),
+        legend.key = element_rect(size = 0.75), 
+        legend.background = element_rect(color = "black", size = 0.5),
+        strip.background = element_blank(), 
+        panel.border = element_rect(colour = "black", fill=NA, size=0.75),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.spacing.x = unit(1, "lines")
+        ) + 
+    guides(color = guide_legend(nrow = 2, byrow = TRUE)) 
+
+# Display the plot
+Leptin_trajectories
+
+
+
+
+```
+
+
+
+
+```{r}
+# Filter and summarize data for ST experiment
+
+
+point_data <- filter(MSD_noNAs_df_MCP1, 
+                     treatment_diet %in% c("Hp_chow", "Ctrl_chow") & days_on_diet == -3) %>%
+  mutate(point_color = case_when(
+    treatment_diet == "Hp_chow" ~ "#E69F00",
+    treatment_diet == "Ctrl_chow" ~ "#0072B2"
+  ))
+
+
+MSD_noNAs_df_MCP1 <- MSD_noNAs_df %>%
+  filter(biomarker == "MCP1") %>%
+  group_by(days_on_diet, sex, treatment_diet) %>%
+  summarize(median_MCP1 = median(conc_log10, na.rm = TRUE),
+            SD_MCP1 = sd(conc_log10, na.rm = TRUE),
+            .groups = 'drop')
+
+
+MCP1_trajectories <- ggplot() +
+  annotate("rect", xmin = 16.8, xmax = Inf, ymin = -Inf, ymax = Inf,
+           fill = "lightgrey", alpha = 0.2) +
+  
+
+  annotate("rect", xmin = -Inf, xmax = 2.9, ymin = -Inf, ymax = Inf,
+           fill = "lightgrey", alpha = 0.2) +
+  
+  geom_line(data = filter(MSD_noNAs_df, biomarker == "MCP1"), aes(x = days_on_diet, y = conc_log10, color = treatment_diet, group = mouseID), alpha = 0.3, size = 0.5) +
+  
+  geom_line(data = MSD_noNAs_df_MCP1, aes(x = days_on_diet, y = median_MCP1, color = treatment_diet, linetype=treatment_diet), size = 1) +
+  
+
+  
+geom_point(
+  data = point_data,
+  aes(x = days_on_diet, y = median_MCP1),
+  color = point_data$point_color,
+  size = 3,
+  shape = 16,
+  show.legend = FALSE
+)+
+
+
+
+  xlab("Time (days)") +
+  ylab(expression(paste("log"[10],"(MCP-1 pg/mL)")))  +
+  facet_wrap(~sex, scales = "free_x") +
+  scale_color_manual(
+    labels = c(
+      expression("Control + CD"),
+      expression("Control + HFD"),
+      expression(italic("H. pylori") * " + CD"),
+      expression(italic("H. pylori") * " + HFD")),
+    values = c(
+      "Ctrl_CD" = "#0072B2",
+      "Ctrl_HFD" = "#0072B2",
+      "Hp_CD" = "#E69F00",
+      "Hp_HFD" = "#E69F00")) +
+  scale_linetype_manual(
+    labels = c(
+      expression("Control + CD"),
+      expression("Control + HFD"),
+      expression(italic("H. pylori") * " + CD"),
+      expression(italic("H. pylori") * " + HFD")),
+    values = c(
+      "Ctrl_CD" = "dotted",
+      "Ctrl_HFD" = "solid",
+      "Hp_CD" = "dotted",
+      "Hp_HFD" = "solid")) + 
+
+
+
+  scale_x_continuous(expand = c(0, 0)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 10),
+        axis.title.y = element_text(size = 12),
+        axis.title.x = element_text(size = 12),
+        axis.text.y = element_text(size = 10),
+        strip.text.x = element_text(size = 12),
+        strip.text.y = element_text(size = 12),
+        legend.position = "bottom", 
+        legend.title = element_blank(), 
+        legend.text = element_text(size = 10), 
+        legend.key.height = unit(0.5, 'cm'),
+        legend.key.width = unit(1, 'cm'),
+        legend.key = element_rect(size = 0.75), 
+        legend.background = element_rect(color = "black", size = 0.5),
+        strip.background = element_blank(), 
+        panel.border = element_rect(colour = "black", fill=NA, size=0.75),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.spacing.x = unit(1, "lines")
+        ) + 
+    guides(color = guide_legend(nrow = 2, byrow = TRUE)) 
+
+# Display the plot
+MCP1_trajectories
+
+
+```
+
+
+```{r}
+
+
+
+MSD_noNAs_df_IL10 <- MSD_noNAs_df %>%
+  filter(biomarker == "IL10") %>%
+  group_by(days_on_diet, sex, treatment_diet) %>%
+  summarize(median_IL10 = median(conc_log10, na.rm = TRUE),
+            SD_IL10 = sd(conc_log10, na.rm = TRUE),
+            .groups = 'drop')
+
+point_data <- filter(MSD_noNAs_df_IL10, 
+                     treatment_diet %in% c("Hp_chow", "Ctrl_chow") & days_on_diet == -3) %>%
+  mutate(point_color = case_when(
+    treatment_diet == "Hp_chow" ~ "#E69F00",
+    treatment_diet == "Ctrl_chow" ~ "#0072B2"
+  ))
+
+# Plot IL10 trajectories
+IL10_trajectories <- ggplot() +
+  annotate("rect", xmin = 16.8, xmax = Inf, ymin = -Inf, ymax = Inf,
+           fill = "lightgrey", alpha = 0.2) +
+  
+
+  annotate("rect", xmin = -Inf, xmax = 2.9, ymin = -Inf, ymax = Inf,
+           fill = "lightgrey", alpha = 0.2) +
+  
+  geom_line(data = filter(MSD_noNAs_df, biomarker == "IL10"), aes(x = days_on_diet, y = conc_log10, color = treatment_diet, group = mouseID), alpha = 0.3, size = 0.5) +
+  
+  geom_line(data = MSD_noNAs_df_IL10, aes(x = days_on_diet, y = median_IL10, color = treatment_diet, linetype=treatment_diet), size = 1) +
+  
+
+  
+geom_point(
+  data = point_data,
+  aes(x = days_on_diet, y = median_IL10),
+  color = point_data$point_color,
+  size = 3,
+  shape = 16,
+  show.legend = FALSE
+)+
+
+
+
+  xlab("Time (days)") +
+  ylab(expression(paste("log"[10],"(IL-10 pg/mL)")))  +
+  facet_wrap(~sex, scales = "free_x") +
+  scale_color_manual(
+    labels = c(
+      expression("Control + CD"),
+      expression("Control + HFD"),
+      expression(italic("H. pylori") * " + CD"),
+      expression(italic("H. pylori") * " + HFD")),
+    values = c(
+      "Ctrl_CD" = "#0072B2",
+      "Ctrl_HFD" = "#0072B2",
+      "Hp_CD" = "#E69F00",
+      "Hp_HFD" = "#E69F00")) +
+  scale_linetype_manual(
+    labels = c(
+      expression("Control + CD"),
+      expression("Control + HFD"),
+      expression(italic("H. pylori") * " + CD"),
+      expression(italic("H. pylori") * " + HFD")),
+    values = c(
+      "Ctrl_CD" = "dotted",
+      "Ctrl_HFD" = "solid",
+      "Hp_CD" = "dotted",
+      "Hp_HFD" = "solid")) + 
+
+
+
+  scale_x_continuous(expand = c(0, 0)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 10),
+        axis.title.y = element_text(size = 12),
+        axis.title.x = element_text(size = 12),
+        axis.text.y = element_text(size = 10),
+        strip.text.x = element_text(size = 12),
+        strip.text.y = element_text(size = 12),
+        legend.position = "bottom", 
+        legend.title = element_blank(), 
+        legend.text = element_text(size = 10), 
+        legend.key.height = unit(0.5, 'cm'),
+        legend.key.width = unit(1, 'cm'),
+        legend.key = element_rect(size = 0.75), 
+        legend.background = element_rect(color = "black", size = 0.5),
+        strip.background = element_blank(), 
+        panel.border = element_rect(colour = "black", fill=NA, size=0.75),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.spacing.x = unit(1, "lines")
+        ) + 
+    guides(color = guide_legend(nrow = 2, byrow = TRUE)) 
+
+# Display the plot
+IL10_trajectories
+
+
+
+
+
+```
+
+```{r}
+# Filter and summarize data for ST experiment
+MSD_noNAs_df_Insulin <- MSD_noNAs_df %>%
+  filter(biomarker == "Insulin") %>%
+  group_by(days_on_diet, sex, treatment_diet) %>%
+  summarize(median_Ins = median(conc_log10, na.rm = TRUE),
+            SD_Ghrl = sd(conc_log10, na.rm = TRUE),
+            .groups = 'drop')
+
+#colorscale for geom_point D-3
+point_data <- filter(MSD_noNAs_df_Insulin, 
+                     treatment_diet %in% c("Hp_chow", "Ctrl_chow") & days_on_diet == -3) %>%
+  mutate(point_color = case_when(
+    treatment_diet == "Hp_chow" ~ "#E69F00",
+    treatment_diet == "Ctrl_chow" ~ "#0072B2"
+  ))
+
+
+
+Insulin_trajectories <- ggplot() +
+  annotate("rect", xmin = 16.8, xmax = Inf, ymin = -Inf, ymax = Inf,
+           fill = "lightgrey", alpha = 0.2) +
+  
+
+  annotate("rect", xmin = -Inf, xmax = 2.9, ymin = -Inf, ymax = Inf,
+           fill = "lightgrey", alpha = 0.2) +
+  
+  geom_line(data = filter(MSD_noNAs_df, biomarker == "Insulin"), aes(x = days_on_diet, y = conc_log10, color = treatment_diet, group = mouseID), alpha = 0.3, size = 0.5) +
+  geom_line(data = MSD_noNAs_df_Insulin, aes(x = days_on_diet, y = median_Ins, color = treatment_diet, linetype=treatment_diet), size = 1) +
+  
+  geom_point(
+  data = point_data,
+  aes(x = days_on_diet, y = median_Ins),
+  color = point_data$point_color,
+  size = 3,
+  shape = 16,
+  show.legend = FALSE)+
+  
+  xlab("Time (days)") +
+  ylab(expression(paste("log"[10],"(Insulin pg/mL)")))  +
+  facet_wrap(~sex, scales = "free_x") +
+  scale_color_manual(
+    labels = c(
+      expression("Control + CD"),
+      expression("Control + HFD"),
+      expression(italic("H. pylori") * " + CD"),
+      expression(italic("H. pylori") * " + HFD")),
+    values = c(
+      "Ctrl_CD" = "#0072B2",
+      "Ctrl_HFD" = "#0072B2",
+      "Hp_CD" = "#E69F00",
+      "Hp_HFD" = "#E69F00")) +
+  scale_linetype_manual(
+    labels = c(
+      expression("Control + CD"),
+      expression("Control + HFD"),
+      expression(italic("H. pylori") * " + CD"),
+      expression(italic("H. pylori") * " + HFD")),
+    values = c(
+      "Ctrl_CD" = "dotted",
+      "Ctrl_HFD" = "solid",
+      "Hp_CD" = "dotted",
+      "Hp_HFD" = "solid")) + 
+  scale_x_continuous(expand = c(0, 0)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 10),
+        axis.title.y = element_text(size = 12),
+        axis.title.x = element_text(size = 12),
+        axis.text.y = element_text(size = 10),
+        strip.text.x = element_text(size = 12),
+        strip.text.y = element_text(size = 12),
+        legend.position = "bottom", 
+        legend.title = element_blank(), 
+        legend.text = element_text(size = 10), 
+        legend.key.height = unit(0.5, 'cm'),
+        legend.key.width = unit(1, 'cm'),
+        legend.key = element_rect(size = 0.75), 
+        legend.background = element_rect(color = "black", size = 0.5),
+        strip.background = element_blank(), 
+        panel.border = element_rect(colour = "black", fill=NA, size=0.75),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.spacing.x = unit(1, "lines")
+        ) + 
+    guides(color = guide_legend(nrow = 2, byrow = TRUE)) 
+
+# Display the plot
+Insulin_trajectories
+
+
+```
+
+
+```{r}
+# Filter and summarize data for ST experiment
+MSD_noNAs_df_PYY <- MSD_noNAs_df %>%
+  filter(biomarker == "PYY") %>%
+  group_by(days_on_diet, sex, treatment_diet) %>%
+  summarize(median_PYY = median(conc_log10, na.rm = TRUE),
+            SD_PYY = sd(conc_log10, na.rm = TRUE),
+            .groups = 'drop')
+
+#colorscale for geom_point D-3
+point_data <- filter(MSD_noNAs_df_PYY, 
+                     treatment_diet %in% c("Hp_chow", "Ctrl_chow") & days_on_diet == -3) %>%
+  mutate(point_color = case_when(
+    treatment_diet == "Hp_chow" ~ "#E69F00",
+    treatment_diet == "Ctrl_chow" ~ "#0072B2"
+  ))
+
+
+
+PYY_trajectories <- ggplot() +
+  annotate("rect", xmin = 16.8, xmax = Inf, ymin = -Inf, ymax = Inf,
+           fill = "lightgrey", alpha = 0.2) +
+  
+
+  annotate("rect", xmin = -Inf, xmax = 2.9, ymin = -Inf, ymax = Inf,
+           fill = "lightgrey", alpha = 0.2) +
+  
+  geom_line(data = filter(MSD_noNAs_df, biomarker == "PYY"), aes(x = days_on_diet, y = conc_log10, color = treatment_diet, group = mouseID), alpha = 0.3, size = 0.5) +
+  geom_line(data = MSD_noNAs_df_PYY, aes(x = days_on_diet, y = median_PYY, color = treatment_diet, linetype=treatment_diet), size = 1) +
+  
+  geom_point(
+  data = point_data,
+  aes(x = days_on_diet, y = median_PYY),
+  color = point_data$point_color,
+  size = 3,
+  shape = 16,
+  show.legend = FALSE)+
+  
+  xlab("Time (days)") +
+  ylab(expression(paste("log"[10],"(PYY pg/mL)")))  +
+  facet_wrap(~sex, scales = "free_x") +
+  scale_color_manual(
+    labels = c(
+      expression("Control + CD"),
+      expression("Control + HFD"),
+      expression(italic("H. pylori") * " + CD"),
+      expression(italic("H. pylori") * " + HFD")),
+    values = c(
+      "Ctrl_CD" = "#0072B2",
+      "Ctrl_HFD" = "#0072B2",
+      "Hp_CD" = "#E69F00",
+      "Hp_HFD" = "#E69F00")) +
+  scale_linetype_manual(
+    labels = c(
+      expression("Control + CD"),
+      expression("Control + HFD"),
+      expression(italic("H. pylori") * " + CD"),
+      expression(italic("H. pylori") * " + HFD")),
+    values = c(
+      "Ctrl_CD" = "dotted",
+      "Ctrl_HFD" = "solid",
+      "Hp_CD" = "dotted",
+      "Hp_HFD" = "solid")) + 
+  scale_x_continuous(expand = c(0, 0)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 10),
+        axis.title.y = element_text(size = 12),
+        axis.title.x = element_text(size = 12),
+        axis.text.y = element_text(size = 10),
+        strip.text.x = element_text(size = 12),
+        strip.text.y = element_text(size = 12),
+        legend.position = "bottom", 
+        legend.title = element_blank(), 
+        legend.text = element_text(size = 10), 
+        legend.key.height = unit(0.5, 'cm'),
+        legend.key.width = unit(1, 'cm'),
+        legend.key = element_rect(size = 0.75), 
+        legend.background = element_rect(color = "black", size = 0.5),
+        strip.background = element_blank(), 
+        panel.border = element_rect(colour = "black", fill=NA, size=0.75),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.spacing.x = unit(1, "lines")
+        ) + 
+    guides(color = guide_legend(nrow = 2, byrow = TRUE)) 
+
+# Display the plot
+PYY_trajectories
+
+```
+
+```{r}
+# Filter and summarize data for ST experiment
+MSD_noNAs_df_GLP1 <- MSD_noNAs_df %>%
+  filter(biomarker == "GLP1") %>%
+  group_by(days_on_diet, sex, treatment_diet) %>%
+  summarize(median_GLP1 = median(conc_log10, na.rm = TRUE),
+            SD_GLP1 = sd(conc_log10, na.rm = TRUE),
+            .groups = 'drop')
+
+#colorscale for geom_point D-3
+point_data <- filter(MSD_noNAs_df_GLP1, 
+                     treatment_diet %in% c("Hp_chow", "Ctrl_chow") & days_on_diet == -3) %>%
+  mutate(point_color = case_when(
+    treatment_diet == "Hp_chow" ~ "#E69F00",
+    treatment_diet == "Ctrl_chow" ~ "#0072B2"
+  ))
+
+
+
+GLP1_trajectories <- ggplot() +
+  annotate("rect", xmin = 16.8, xmax = Inf, ymin = -Inf, ymax = Inf,
+           fill = "lightgrey", alpha = 0.2) +
+  
+
+  annotate("rect", xmin = -Inf, xmax = 2.9, ymin = -Inf, ymax = Inf,
+           fill = "lightgrey", alpha = 0.2) +
+  
+  geom_line(data = filter(MSD_noNAs_df, biomarker == "GLP1"), aes(x = days_on_diet, y = conc_log10, color = treatment_diet, group = mouseID), alpha = 0.3, size = 0.5) +
+  geom_line(data = MSD_noNAs_df_GLP1, aes(x = days_on_diet, y = median_GLP1, color = treatment_diet, linetype=treatment_diet), size = 1) +
+  
+  geom_point(
+  data = point_data,
+  aes(x = days_on_diet, y = median_GLP1),
+  color = point_data$point_color,
+  size = 3,
+  shape = 16,
+  show.legend = FALSE)+
+  
+  xlab("Time (days)") +
+  ylab(expression(paste("log"[10],"(GLP1 pg/mL)")))  +
+  facet_wrap(~sex, scales = "free_x") +
+  scale_color_manual(
+    labels = c(
+      expression("Control + CD"),
+      expression("Control + HFD"),
+      expression(italic("H. pylori") * " + CD"),
+      expression(italic("H. pylori") * " + HFD")),
+    values = c(
+      "Ctrl_CD" = "#0072B2",
+      "Ctrl_HFD" = "#0072B2",
+      "Hp_CD" = "#E69F00",
+      "Hp_HFD" = "#E69F00")) +
+  scale_linetype_manual(
+    labels = c(
+      expression("Control + CD"),
+      expression("Control + HFD"),
+      expression(italic("H. pylori") * " + CD"),
+      expression(italic("H. pylori") * " + HFD")),
+    values = c(
+      "Ctrl_CD" = "dotted",
+      "Ctrl_HFD" = "solid",
+      "Hp_CD" = "dotted",
+      "Hp_HFD" = "solid")) + 
+  scale_x_continuous(expand = c(0, 0)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 10),
+        axis.title.y = element_text(size = 12),
+        axis.title.x = element_text(size = 12),
+        axis.text.y = element_text(size = 10),
+        strip.text.x = element_text(size = 12),
+        strip.text.y = element_text(size = 12),
+        legend.position = "bottom", 
+        legend.title = element_blank(), 
+        legend.text = element_text(size = 10), 
+        legend.key.height = unit(0.5, 'cm'),
+        legend.key.width = unit(1, 'cm'),
+        legend.key = element_rect(size = 0.75), 
+        legend.background = element_rect(color = "black", size = 0.5),
+        strip.background = element_blank(), 
+        panel.border = element_rect(colour = "black", fill=NA, size=0.75),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.spacing.x = unit(1, "lines")
+        ) + 
+    guides(color = guide_legend(nrow = 2, byrow = TRUE)) 
+
+# Display the plot
+GLP1_trajectories
+```
+
+```{r}
+# Filter and summarize data for ST experiment
+MSD_noNAs_df_TNFa <- MSD_noNAs_df %>%
+  filter(biomarker == "TNFa") %>%
+  group_by(days_on_diet, sex, treatment_diet) %>%
+  summarize(median_TNFa = median(conc_log10, na.rm = TRUE),
+            SD_TNFa = sd(conc_log10, na.rm = TRUE),
+            .groups = 'drop')
+
+#colorscale for geom_point D-3
+point_data <- filter(MSD_noNAs_df_TNFa, 
+                     treatment_diet %in% c("Hp_chow", "Ctrl_chow") & days_on_diet == -3) %>%
+  mutate(point_color = case_when(
+    treatment_diet == "Hp_chow" ~ "#E69F00",
+    treatment_diet == "Ctrl_chow" ~ "#0072B2"
+  ))
+
+
+
+TNFa_trajectories <- ggplot() +
+  annotate("rect", xmin = 16.8, xmax = Inf, ymin = -Inf, ymax = Inf,
+           fill = "lightgrey", alpha = 0.2) +
+  
+
+  annotate("rect", xmin = -Inf, xmax = 2.9, ymin = -Inf, ymax = Inf,
+           fill = "lightgrey", alpha = 0.2) +
+  
+  geom_line(data = filter(MSD_noNAs_df, biomarker == "TNFa"), aes(x = days_on_diet, y = conc_log10, color = treatment_diet, group = mouseID), alpha = 0.3, size = 0.5) +
+  geom_line(data = MSD_noNAs_df_TNFa, aes(x = days_on_diet, y = median_TNFa, color = treatment_diet, linetype=treatment_diet), size = 1) +
+  
+  geom_point(
+  data = point_data,
+  aes(x = days_on_diet, y = median_TNFa),
+  color = point_data$point_color,
+  size = 3,
+  shape = 16,
+  show.legend = FALSE)+
+  
+  xlab("Time (days)") +
+  ylab(expression(paste("log"[10],"(TNFa pg/mL)")))  +
+  facet_wrap(~sex, scales = "free_x") +
+  scale_color_manual(
+    labels = c(
+      expression("Control + CD"),
+      expression("Control + HFD"),
+      expression(italic("H. pylori") * " + CD"),
+      expression(italic("H. pylori") * " + HFD")),
+    values = c(
+      "Ctrl_CD" = "#0072B2",
+      "Ctrl_HFD" = "#0072B2",
+      "Hp_CD" = "#E69F00",
+      "Hp_HFD" = "#E69F00")) +
+  scale_linetype_manual(
+    labels = c(
+      expression("Control + CD"),
+      expression("Control + HFD"),
+      expression(italic("H. pylori") * " + CD"),
+      expression(italic("H. pylori") * " + HFD")),
+    values = c(
+      "Ctrl_CD" = "dotted",
+      "Ctrl_HFD" = "solid",
+      "Hp_CD" = "dotted",
+      "Hp_HFD" = "solid")) + 
+  scale_x_continuous(expand = c(0, 0)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 10),
+        axis.title.y = element_text(size = 12),
+        axis.title.x = element_text(size = 12),
+        axis.text.y = element_text(size = 10),
+        strip.text.x = element_text(size = 12),
+        strip.text.y = element_text(size = 12),
+        legend.position = "bottom", 
+        legend.title = element_blank(), 
+        legend.text = element_text(size = 10), 
+        legend.key.height = unit(0.5, 'cm'),
+        legend.key.width = unit(1, 'cm'),
+        legend.key = element_rect(size = 0.75), 
+        legend.background = element_rect(color = "black", size = 0.5),
+        strip.background = element_blank(), 
+        panel.border = element_rect(colour = "black", fill=NA, size=0.75),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.spacing.x = unit(1, "lines")
+        ) + 
+    guides(color = guide_legend(nrow = 2, byrow = TRUE)) 
+
+# Display the plot
+TNFa_trajectories
+```
+
+
+```{r}
+Fig_S3ABC <- (
+  (Ghrelin_trajectories + theme(legend.position = "none")) /
+  (Leptin_trajectories + theme(legend.position = "none")) /
+  IL6_trajectories
+) +
+  plot_annotation(tag_levels = "A") &
+  theme(plot.tag = element_text(face = "bold", size = 14))
+Fig_S3ABC 
+```
+
+
+```{r}
+
+
+# Create the layout
+Fig_S3DEF <- wrap_plots(
+  MCP1_trajectories + theme(legend.position = "none") + labs(tag = "D"),
+  Insulin_trajectories + theme(legend.position = "none") + labs(tag = "E"),
+  TNFa_trajectories + labs(tag = "F"),
+  ncol = 1
+) & theme(plot.tag = element_text(face = "bold", size = 14))
+
+Fig_S3DEF
+
+
+
+```
+
+```{r}
+
+
+# Create the layout
+Fig_S3GHI <- wrap_plots(
+  PYY_trajectories + theme(legend.position = "none") + labs(tag = "G"),
+  IL10_trajectories + theme(legend.position = "none") + labs(tag = "H"),
+  GLP1_trajectories + labs(tag = "I"),
+  ncol = 1
+) & theme(plot.tag = element_text(face = "bold", size = 14))
+
+Fig_S3GHI
+
+```
