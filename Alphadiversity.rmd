@@ -1,0 +1,1294 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-12-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(ggplot2)
+library(phyloseq)
+library(speedyseq)
+library(readxl)
+library(vegan)
+library(ggpubr)
+library(tidyverse)
+library(EnvStats)
+library(rstatix)
+library(MicEco)
+library(ggbeeswarm)
+library(redres)
+library(modelsummary)
+library(sjPlot)
+library(ggh4x)
+library(dplyr)
+library(tidyr)
+library(tidybayes)
+library(stringr)
+library(forcats)
+library(brms)
+
+```
+
+```{r}
+physeq_LT <- readRDS("/LT_physeq_scrub_0.98clustered.rds") %>%
+  rename_sample_data(mouseID = animalID)
+
+physeq_LT <- subset_samples(physeq_LT, !(mouseID %in% c("EO4.2_MR", "EO4.2_ML", "EO4.6_ML", "EO4.2_MN", "EO4.7_MN", "EO4.11_FR", "EO4.5_FN"))) # filter out mice that died during the experiment
+
+physeq_ST <- readRDS("ST_physeq_scrub_0.98clustered.rds") %>%
+  rename_sample_data(mouseID = animal_ID)
+
+physeq_ST <- subset_taxa(physeq_ST, Kingdom != "unassigned" & Family != "Mitochondria") # Eukaryota (Kingdom) and Chloroplast (Class) as well, if present 
+```
+
+```{r}
+# Load Hp loads data
+MS1_Hp_loads <- read_xlsx("MS1_Hp_loads.xlsx") %>%
+  select(mouseID, experiment, total_bact_load, avg_copies, total_Hp_abund, total_DNA_conc, Hp_copies_std) 
+
+# subset Hp loads data by experiment
+MS1_Hp_loads_LT <- MS1_Hp_loads %>% 
+  filter(experiment == "LT") %>%
+  select(-experiment)
+MS1_Hp_loads_ST <- MS1_Hp_loads %>% 
+  filter(experiment == "ST") %>%
+  select(-experiment)
+
+# Add Hp loads to phyloseq objects
+physeq_LT <- physeq_LT %>% 
+  inner_join_sample_data(MS1_Hp_loads_LT, by = "mouseID") 
+physeq_ST <- physeq_ST %>% 
+  inner_join_sample_data(MS1_Hp_loads_ST, by = "mouseID") 
+
+```
+
+
+## Short-term
+```{r calc-diversity-metrics}
+alpha_div_ST <- data.frame(estimate_richness(physeq_ST, measures = c("Shannon", "Observed")), sample_data(physeq_ST)) %>%
+  filter(!is.na(treatment)) %>%
+  mutate(
+    treatment = str_replace(treatment, "Control", "Ctrl"),
+    diet = str_replace(diet, "HF", "HFD"),
+    diet = str_replace(diet, "CTRL", "CD"),
+    weeks_on_diet = age_weeks - 6,
+    diet_new = if_else(timepoint %in% c("t0", "t1"), "chow", diet),
+    diet_new = factor(diet_new, levels = c("chow", "CD", "HFD")),  
+    treatment_diet = paste(treatment, diet, sep = "_"),
+    treatment_diet_new = paste(treatment, diet_new, sep = "_")
+  )
+```
+
+
+```{r}
+#Set pre and post diet intervention
+alpha_div_ST <- alpha_div_ST %>%
+  mutate(
+    Phase = case_when(
+      weeks_on_diet %in% c(-2, 0) ~ "Pre",  
+      weeks_on_diet %in% c(1)        ~ "Post", 
+      TRUE                              ~ NA_character_ 
+    )
+  )
+
+alpha_div_ST$Phase <- factor(alpha_div_ST$Phase, levels = c("Pre", "Post"))
+```
+
+```{r}
+#Pre diet switch, Shannon
+
+summ_ci <- function(x, widths = c(0.95)) {
+  qi <- tidybayes::median_qi(x, .width = widths)
+  tibble(median = qi$.value, CI_low = qi$.lower, CI_high = qi$.upper)
+}
+
+# 1. Filter Data
+data_pre <- alpha_div_ST %>% 
+  filter(Phase == "Pre") %>%
+  mutate(
+    # Ensure TimePoint is a factor (e.g., "Week -1", "Week 0")
+    weeks_on_diet = factor(weeks_on_diet) 
+  )
+
+
+
+# 2. Run the Model
+
+model_baseline <- brm(
+  formula = Shannon ~ sex * treatment * weeks_on_diet + (1 | mouseID),
+  data = data_pre,
+  family = student(), 
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(student_t(3, 0, 1), class = "sigma")
+  ),
+  chains = 4, iter = 4000,
+  backend = "cmdstanr"
+)
+
+mf <- model.frame(model_baseline)
+
+grid_pre <- tidyr::expand_grid(
+  sex = unique(mf$sex),
+  treatment = unique(mf$treatment),
+  weeks_on_diet = levels(mf$weeks_on_diet)
+) %>%
+  dplyr::mutate(
+    sex = factor(sex, levels = unique(mf$sex)),
+    treatment = factor(treatment, levels = unique(mf$treatment)),
+    weeks_on_diet = factor(weeks_on_diet, levels = levels(mf$weeks_on_diet))
+  )
+
+draws_pre <- grid_pre %>%
+  tidybayes::add_epred_draws(
+    model_baseline,
+    ndraws = 2000,
+    re_formula = NA
+  )
+
+# 3) Average across baseline weeks within each draw, for each sex+treatment
+pre_means <- draws_pre %>%
+  group_by(.draw, sex, treatment) %>%
+  summarise(Mean_Shannon = mean(.epred), .groups = "drop")
+
+# 4) Manual contrast: Hp - Ctrl within each draw + sex
+baseline_diff <- pre_means %>%
+  tidyr::pivot_wider(names_from = treatment, values_from = Mean_Shannon) %>%
+  mutate(Hp_minus_Ctrl = Hp - Ctrl) %>%
+  select(.draw, sex, Hp_minus_Ctrl)
+
+baseline_stats <- baseline_diff %>%
+  group_by(sex) %>%
+  summarise(
+    Effect = median(Hp_minus_Ctrl),
+    CI_Lower = quantile(Hp_minus_Ctrl, 0.025),
+    CI_Upper = quantile(Hp_minus_Ctrl, 0.975),
+    Prob_Decrease = mean(Hp_minus_Ctrl < 0),
+    Pd = pmax(mean(Hp_minus_Ctrl < 0), mean(Hp_minus_Ctrl > 0)),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+print(baseline_stats)
+
+pre_plot_df <- baseline_diff %>%
+  group_by(sex) %>%
+  summarise(
+    median  = median(Hp_minus_Ctrl),
+    CI_low  = quantile(Hp_minus_Ctrl, 0.025),
+    CI_high = quantile(Hp_minus_Ctrl, 0.975),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    phase = "Pre (Chow)",
+    biomarker = "Alpha diversity (Shannon)",
+    label = "Treatment (Hp − Ctrl), baseline (mean of chow weeks)",
+    type = "Simple Effects"
+  )
+```
+
+
+```{r}
+### Is the change in Shannon diversity after diet change affected by the treament?
+
+# ------------------------------------------------------------
+# 1) Create delta outcome (Post - mean(Pre)) per mouse
+# ------------------------------------------------------------
+delta_data <- alpha_div_ST %>%
+  filter(Phase %in% c("Pre", "Post")) %>%
+  group_by(mouseID) %>%
+  filter(any(Phase == "Pre"), any(Phase == "Post")) %>%
+  summarise(
+    delta_Shannon = mean(Shannon[Phase == "Post"], na.rm = TRUE) -
+                    mean(Shannon[Phase == "Pre"], na.rm = TRUE),
+    sex       = first(sex),
+    treatment = first(treatment),
+    diet      = first(diet),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    sex       = factor(sex, levels = c("female", "male")),
+    diet      = factor(diet, levels = c("CD", "HFD")),
+    treatment = factor(treatment, levels = c("Ctrl", "Hp"))
+  )
+# ------------------------------------------------------------
+# 2) Fit model on delta (difference scale)
+# ------------------------------------------------------------
+model_post_switch <- brm(
+  delta_Shannon ~ sex * diet * treatment,
+  data = delta_data,
+  family = student(),
+  prior = c(
+    prior(normal(0, 0.5), class = "b"),
+    prior(student_t(3, 0, 1), class = "sigma")
+  ),
+  chains = 4, iter = 4000, warmup = 2000,
+  backend = "cmdstanr",
+  control = list(adapt_delta = 0.99),
+  seed = 123
+)
+
+# ------------------------------------------------------------
+# 3) Posterior predictions on a grid
+# ------------------------------------------------------------
+grid_post <- tidyr::expand_grid(
+  sex       = levels(delta_data$sex),
+  diet      = levels(delta_data$diet),        # CD, HFD
+  treatment = levels(delta_data$treatment)    # Ctrl, Hp
+)
+
+preds_post <- model_post_switch %>%
+  add_epred_draws(newdata = grid_post, ndraws = 2000, re_formula = NA) %>%
+  group_by(.draw, sex, diet, treatment) %>%
+  summarise(epred = mean(.epred), .groups = "drop")
+
+# Helper: summarize draw-level effects into median + CI
+summ_eff <- function(df, label, type) {
+  df %>%
+    group_by(sex) %>%
+    summarise(
+      median  = median(effect),
+      CI_low  = quantile(effect, 0.025),
+      CI_high = quantile(effect, 0.975),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      phase = "Post (Diet switch)",
+      biomarker = "Alpha diversity (Shannon)",
+      label = label,
+      type  = type
+    )
+}
+
+# ------------------------------------------------------------
+# B) MAIN EFFECTS (marginalized)
+# ------------------------------------------------------------
+
+# Treatment main effect: (Hp - Ctrl), averaged across diets
+eff_main_treat <- preds_post %>%
+  group_by(.draw, sex, treatment) %>%
+  summarise(mu = mean(epred), .groups = "drop") %>%
+  pivot_wider(names_from = treatment, values_from = mu) %>%
+  mutate(effect = Hp - Ctrl) %>%
+  select(.draw, sex, effect) %>%
+  summ_eff(label = "Treatment (Hp − Ctrl)", type = "Main Effects")
+
+# Diet main effect: (HFD - CD), averaged across treatments
+eff_main_diet <- preds_post %>%
+  group_by(.draw, sex, diet) %>%
+  summarise(mu = mean(epred), .groups = "drop") %>%
+  pivot_wider(names_from = diet, values_from = mu) %>%
+  mutate(effect = HFD - CD) %>%
+  select(.draw, sex, effect) %>%
+  summ_eff(label = "Diet (HFD − CD)", type = "Main Effects")
+
+# ------------------------------------------------------------
+# C) SIMPLE EFFECTS (within strata)
+# ------------------------------------------------------------
+
+# Treatment simple effects within each diet: (Hp - Ctrl) in CD / HFD
+eff_simple_treat <- preds_post %>%
+  pivot_wider(names_from = treatment, values_from = epred) %>%
+  mutate(effect = Hp - Ctrl) %>%
+  group_by(.draw, sex, diet) %>%
+  summarise(effect = mean(effect), .groups = "drop") %>%
+  group_by(sex, diet) %>%
+  summarise(
+    median  = median(effect),
+    CI_low  = quantile(effect, 0.025),
+    CI_high = quantile(effect, 0.975),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    phase = "Post (Diet switch)",
+    biomarker = "Alpha diversity (Shannon)",
+    type = "Simple Effects",
+    label = paste0("Treatment (Hp − Ctrl) in ", diet)
+  )
+
+# Diet simple effects within each treatment: (HFD - CD) in Ctrl / Hp
+eff_simple_diet <- preds_post %>%
+  pivot_wider(names_from = diet, values_from = epred) %>%
+  mutate(effect = HFD - CD) %>%
+  group_by(.draw, sex, treatment) %>%
+  summarise(effect = mean(effect), .groups = "drop") %>%
+  group_by(sex, treatment) %>%
+  summarise(
+    median  = median(effect),
+    CI_low  = quantile(effect, 0.025),
+    CI_high = quantile(effect, 0.975),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    phase = "Post (Diet switch)",
+    biomarker = "Alpha diversity (Shannon)",
+    type = "Simple Effects",
+    label = paste0("Diet (HFD − CD) in ", treatment)
+  )
+
+# ------------------------------------------------------------
+# D) INTERACTION: [ (Hp-Ctrl) in HFD ] - [ (Hp-Ctrl) in CD ]
+# ------------------------------------------------------------
+eff_interaction <- preds_post %>%
+  pivot_wider(names_from = treatment, values_from = epred) %>%
+  mutate(Hp_minus_Ctrl = Hp - Ctrl) %>%
+  select(.draw, sex, diet, Hp_minus_Ctrl) %>%
+  group_by(.draw, sex, diet) %>%
+  summarise(Hp_minus_Ctrl = mean(Hp_minus_Ctrl), .groups = "drop") %>%
+  pivot_wider(names_from = diet, values_from = Hp_minus_Ctrl) %>%
+  mutate(effect = HFD - CD) %>%
+  select(.draw, sex, effect) %>%
+  summ_eff(label = "Interaction: (Hp−Ctrl) HFD − CD", type = "Interaction")
+
+# Baseline row (already summarized)
+pre_plot_df <- pre_plot_df %>%
+  mutate(
+    phase = "Pre (Chow)",
+    biomarker = "Alpha diversity (Shannon)",
+    type = "Simple Effects",
+    label = "Treatment (pre diet switch)"
+  )
+
+# Standard short labels for Shannon
+recode_labels_shannon <- function(x) {
+  case_when(
+    str_detect(x, "pre diet switch") ~ "Treatment (pre diet switch)",
+
+    x == "Diet (HFD − CD)" ~ "Diet",
+    x == "Treatment (Hp − Ctrl)" ~ "Treatment",
+
+    str_detect(x, "^Interaction") ~ "Interaction",
+
+    str_detect(x, "^Diet \\(HFD − CD\\) in Ctrl") ~ "Diet in Ctrl",
+    str_detect(x, "^Diet \\(HFD − CD\\) in Hp")   ~ "Diet in Hp",
+    str_detect(x, "^Treatment \\(Hp − Ctrl\\) in CD")  ~ "Treatment in CD",
+    str_detect(x, "^Treatment \\(Hp − Ctrl\\) in HFD") ~ "Treatment in HFD",
+
+    TRUE ~ x
+  )
+}
+
+label_levels_std <- c(
+  "Diet in Ctrl",
+  "Diet in Hp",
+  "Treatment in CD",
+  "Treatment in HFD",
+  "Interaction",
+  "Diet",
+  "Treatment",
+  "Treatment (pre diet switch)"
+)
+
+plot_df_div <- bind_rows(
+  pre_plot_df,
+  eff_main_diet,
+  eff_main_treat,
+  eff_interaction,
+  eff_simple_diet,
+  eff_simple_treat
+) %>%
+  mutate(
+    label = recode_labels_shannon(as.character(label)),
+    label = factor(label, levels = label_levels_std),
+    type  = factor(type, levels = c("Main Effects", "Interaction", "Simple Effects")),
+    sex   = factor(sex, levels = c("female", "male"))
+  )
+
+# ---- Forest plot (difference scale) ----
+ST_Shannon_fecal_pre_post_forest <- ggplot(plot_df_div,
+  aes(y = label, x = median, color = sex)
+) +
+  geom_pointrange(
+    aes(xmin = CI_low, xmax = CI_high, shape = type),
+    position = position_dodge(width = 0.6),
+    size = 0.8
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed") +   
+  scale_color_manual(values = c("female" = "#b19cd9", "male" = "#6a0dad")) +
+  scale_shape_manual(values = c(
+    "Main Effects"   = 16,
+    "Interaction"    = 18,
+    "Simple Effects" = 15
+  )) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.text.y        = element_text(color = "black"),
+    legend.position    = "bottom",
+    legend.box         = "vertical"
+  ) +
+  labs(
+    x = "Effect difference (Hp − Ctrl)",
+    y = "",
+    color = "Sex",
+    shape = "Effect type"
+  )
+
+ST_Shannon_fecal_pre_post_forest
+
+
+```
+
+```{r}
+#fecal richness pre-post switch
+
+data_pre <- alpha_div_ST %>%
+  filter(Phase == "Pre") %>%
+  mutate(
+    weeks_on_diet = factor(weeks_on_diet),
+    sex = factor(sex, levels = c("female", "male")),
+    treatment = factor(treatment, levels = c("Ctrl", "Hp"))
+  )
+
+data_post <- alpha_div_ST %>%
+  filter(Phase == "Post") %>%
+  mutate(
+    sex = factor(sex, levels = c("female", "male")),
+    treatment = factor(treatment, levels = c("Ctrl", "Hp")),
+    diet = factor(diet, levels = c("CD", "HFD"))
+  )
+
+# -----------------------------
+# 1) BASELINE NB mixed model (Pre only)
+# -----------------------------
+model_baseline_ob_nb <- brm(
+  Observed ~ sex * treatment * weeks_on_diet + (1 | mouseID),
+  data = data_pre,
+  family = negbinomial(link = "log"),
+  prior = c(
+    prior(normal(0, 1), class = "b"),        # effects on log mean
+    prior(exponential(1), class = "shape"),  # overdispersion
+    prior(exponential(1), class = "sd")      # RE SD
+  ),
+  chains = 4, iter = 4000, warmup = 2000,
+  control = list(adapt_delta = 0.99),
+  backend = "cmdstanr",
+  seed = 123
+)
+
+
+# ============================================================
+# BASELINE (Pre): Hp/Ctrl ratio averaged across chow weeks
+# ============================================================
+grid_pre_ob <- tidyr::expand_grid(
+  sex = levels(data_pre$sex),
+  treatment = levels(data_pre$treatment),
+  weeks_on_diet = levels(data_pre$weeks_on_diet)
+)
+
+draws_pre_ob <- model_baseline_ob_nb %>%
+  add_epred_draws(newdata = grid_pre_ob, ndraws = 2000, re_formula = NA)
+
+pre_means_ob <- draws_pre_ob %>%
+  group_by(.draw, sex, treatment) %>%
+  summarise(mu = mean(.epred), .groups = "drop")
+
+baseline_ratio_ob <- pre_means_ob %>%
+  pivot_wider(names_from = treatment, values_from = mu) %>%
+  mutate(effect = Hp / Ctrl) %>%
+  select(.draw, sex, effect)
+
+baseline_stats_ob <- baseline_ratio_ob %>%
+  group_by(sex) %>%
+  summarise(
+    Ratio = median(effect),
+    CI_Lower = quantile(effect, 0.025),
+    CI_Upper = quantile(effect, 0.975),
+    Prob_Decrease = mean(effect < 1),
+    Pd = pmax(mean(effect < 1), mean(effect > 1)),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+print(baseline_stats_ob)
+
+pre_plot_df_ob <- baseline_ratio_ob %>%
+  group_by(sex) %>%
+  summarise(
+    median  = median(effect),
+    CI_low  = quantile(effect, 0.025),
+    CI_high = quantile(effect, 0.975),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    phase = "Pre (Chow)",
+    biomarker = "Observed species",
+    label = "Treatment (Hp/Ctrl), baseline (avg. across chow weeks)",
+    type = "Simple Effects"
+  )
+
+# ============================================================
+# POST (Post only): NB model + effects on ratio scale
+# ============================================================
+
+model_post_ob_nb <- brm(
+  Observed ~ sex * diet * treatment + (1 | mouseID),
+  data = data_post,
+  family = negbinomial(link = "log"),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(exponential(1), class = "shape"),
+    prior(exponential(1), class = "sd")
+  ),
+  chains = 4, iter = 4000, warmup = 2000,
+  control = list(adapt_delta = 0.99),
+  backend = "cmdstanr",
+  seed = 123
+)
+
+grid_post_ob <- tidyr::expand_grid(
+  sex = levels(data_post$sex),
+  diet = levels(data_post$diet),
+  treatment = levels(data_post$treatment)
+)
+
+draws_post_ob <- model_post_ob_nb %>%
+  add_epred_draws(newdata = grid_post_ob, ndraws = 2000, re_formula = NA)
+
+preds_post_ob <- draws_post_ob %>%
+  group_by(.draw, sex, diet, treatment) %>%
+  summarise(epred = mean(.epred), .groups = "drop")
+
+# -------------------------
+# SIMPLE EFFECTS (Post)
+# -------------------------
+# Treatment within diet: Hp/Ctrl in CD & HFD
+eff_simple_treat_ob <- preds_post_ob %>%
+  pivot_wider(names_from = treatment, values_from = epred) %>%
+  mutate(effect = Hp / Ctrl) %>%
+  group_by(sex, diet) %>%
+  summarise(
+    median = median(effect),
+    CI_low = quantile(effect, 0.025),
+    CI_high = quantile(effect, 0.975),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    phase = "Post (Diet switch)",
+    biomarker = "Observed species",
+    type = "Simple Effects",
+    label = paste0("Treatment (Hp/Ctrl) in ", diet)
+  )
+
+# Diet within treatment: HFD/CD in Ctrl & Hp
+eff_simple_diet_ob <- preds_post_ob %>%
+  pivot_wider(names_from = diet, values_from = epred) %>%
+  mutate(effect = HFD / CD) %>%
+  group_by(sex, treatment) %>%
+  summarise(
+    median = median(effect),
+    CI_low = quantile(effect, 0.025),
+    CI_high = quantile(effect, 0.975),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    phase = "Post (Diet switch)",
+    biomarker = "Observed species",
+    type = "Simple Effects",
+    label = paste0("Diet (HFD/CD) in ", treatment)
+  )
+
+# -------------------------
+# MAIN EFFECTS (Post)
+# -------------------------
+# Main Treatment effect: average Hp/Ctrl over diets within draw
+eff_main_treat_ob <- preds_post_ob %>%
+  pivot_wider(names_from = treatment, values_from = epred) %>%
+  mutate(Hp_over_Ctrl = Hp / Ctrl) %>%
+  group_by(.draw, sex) %>%
+  summarise(effect = mean(Hp_over_Ctrl), .groups = "drop") %>%
+  group_by(sex) %>%
+  summarise(
+    median = median(effect),
+    CI_low = quantile(effect, 0.025),
+    CI_high = quantile(effect, 0.975),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    phase = "Post (Diet switch)",
+    biomarker = "Observed species",
+    type = "Main Effects",
+    label = "Treatment (Hp/Ctrl)"
+  )
+
+# Main Diet effect: average HFD/CD over treatments within draw
+eff_main_diet_ob <- preds_post_ob %>%
+  pivot_wider(names_from = diet, values_from = epred) %>%
+  mutate(HFD_over_CD = HFD / CD) %>%
+  group_by(.draw, sex) %>%
+  summarise(effect = mean(HFD_over_CD), .groups = "drop") %>%
+  group_by(sex) %>%
+  summarise(
+    median = median(effect),
+    CI_low = quantile(effect, 0.025),
+    CI_high = quantile(effect, 0.975),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    phase = "Post (Diet switch)",
+    biomarker = "Observed species",
+    type = "Main Effects",
+    label = "Diet (HFD/CD)"
+  )
+
+# Interaction: (Hp/Ctrl in HFD) / (Hp/Ctrl in CD)
+eff_interaction_ob <- preds_post_ob %>%
+  pivot_wider(names_from = treatment, values_from = epred) %>%
+  mutate(Hp_over_Ctrl = Hp / Ctrl) %>%
+  select(.draw, sex, diet, Hp_over_Ctrl) %>%
+  pivot_wider(names_from = diet, values_from = Hp_over_Ctrl) %>%
+  mutate(effect = HFD / CD) %>%   # ratio-of-ratios
+  group_by(sex) %>%
+  summarise(
+    median = median(effect),
+    CI_low = quantile(effect, 0.025),
+    CI_high = quantile(effect, 0.975),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    phase = "Post (Diet switch)",
+    biomarker = "Observed species",
+    type = "Interaction",
+    label = "Interaction: (Hp/Ctrl) HFD ÷ CD"
+  )
+
+# ============================================================
+# COMBINE + ORDER
+# ============================================================
+
+pre_plot_df_ob <- pre_plot_df_ob %>%
+  mutate(label = "Treatment (Hp/Ctrl), baseline (avg. across chow weeks)",
+         type = "Simple Effects")
+
+eff_main_treat_ob <- eff_main_treat_ob %>%
+  mutate(label = "Treatment (Hp/Ctrl)", type = "Main Effects")
+
+eff_main_diet_ob <- eff_main_diet_ob %>%
+  mutate(label = "Diet (HFD/CD)", type = "Main Effects")
+
+eff_interaction_ob <- eff_interaction_ob %>%
+  mutate(label = "Interaction: (Hp/Ctrl) HFD ÷ CD", type = "Interaction")
+
+eff_simple_treat_ob <- eff_simple_treat_ob %>%
+  mutate(label = paste0("Treatment (Hp/Ctrl) in ", diet),
+         type = "Simple Effects")
+
+eff_simple_diet_ob <- eff_simple_diet_ob %>%
+  mutate(label = paste0("Diet (HFD/CD) in ", treatment),
+         type = "Simple Effects")
+
+
+# 1) Recode long labels -> short standard labels
+recode_labels <- function(x) {
+  dplyr::case_when(
+    # baseline row (Observed)
+    str_detect(x, "baseline") ~ "Treatment (pre diet switch)",
+
+    # main effects
+    x %in% c("Diet (HFD/CD)") ~ "Diet",
+    x %in% c("Treatment (Hp/Ctrl)") ~ "Treatment",
+
+    # interaction
+    str_detect(x, "^Interaction") ~ "Interaction",
+
+    # simple effects
+    str_detect(x, "^Diet \\(HFD/CD\\) in Ctrl") ~ "Diet in Ctrl",
+    str_detect(x, "^Diet \\(HFD/CD\\) in Hp")   ~ "Diet in Hp",
+    str_detect(x, "^Treatment \\(Hp/Ctrl\\) in CD")  ~ "Treatment in CD",
+    str_detect(x, "^Treatment \\(Hp/Ctrl\\) in HFD") ~ "Treatment in HFD",
+
+    TRUE ~ x
+  )
+}
+
+# 2) Shared row order
+label_levels_std <- c(
+  "Diet in Ctrl",
+  "Diet in Hp",
+  "Treatment in CD",
+  "Treatment in HFD",
+  "Interaction",
+  "Diet",
+  "Treatment",
+  "Treatment (pre diet switch)"
+)
+
+# 3) Bind THEN recode/factorize labels
+plot_df_div_ob <- bind_rows(
+  pre_plot_df_ob,
+  eff_main_diet_ob,
+  eff_main_treat_ob,
+  eff_interaction_ob,
+  eff_simple_diet_ob,
+  eff_simple_treat_ob
+) %>%
+  mutate(
+    label = recode_labels(as.character(label)),
+    label = factor(label, levels = label_levels_std),
+    type  = factor(type, levels = c("Main Effects", "Interaction", "Simple Effects")),
+    sex   = factor(sex,  levels = c("female", "male"))
+  )
+
+# 4) Forest plot (ratio scale)
+ST_Observed_fecal_pre_post_forest <- ggplot(plot_df_div_ob,
+                                            aes(y = label, x = median, color = sex)) +
+  geom_pointrange(
+    aes(xmin = CI_low, xmax = CI_high, shape = type),
+    position = position_dodge(width = 0.6),
+    size = 0.8
+  ) +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  scale_color_manual(values = c("female" = "#b19cd9", "male" = "#6a0dad")) +
+  scale_shape_manual(values = c(
+    "Main Effects"   = 16,
+    "Interaction"    = 18,
+    "Simple Effects" = 15
+  )) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.text.y        = element_text(color = "black"),
+    legend.position    = "bottom",
+    legend.box         = "vertical"
+  ) +
+  labs(
+    x = "Effect ratio (Hp / Control)",
+    y = "",
+    color = "Sex",
+    shape = "Effect type"
+  )
+
+ST_Observed_fecal_pre_post_forest
+
+```
+
+
+```{r}
+p_observed <- ST_Observed_fecal_pre_post_forest +
+  labs(title = "Observed species") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+p_shannon <- ST_Shannon_fecal_pre_post_forest +
+  labs(title = "Shannon") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+fecal_alpha_composite <- (p_observed | p_shannon) +
+  plot_layout(guides = "collect") +   # one shared legend
+  plot_annotation(tag_levels = "A") & # A, B
+  theme(
+    legend.position = "bottom",
+    legend.box = "vertical",
+    plot.tag = element_text(face = "bold", size = 14),
+    plot.tag.position = c(0, 1)
+  )
+
+fecal_alpha_composite
+
+# Save
+ggsave("fecal_alpha_composite.jpeg", plot = fecal_alpha_composite, width = 12, height = 5, units = "in")
+
+
+```
+
+
+```{r}
+
+###diversity at experiment termination
+
+# Filter and prepare the data
+alpha_div_GIT_ST <- alpha_div_ST %>%
+  filter(!is.na(treatment), timepoint == "t4") %>%
+  mutate(
+    sample_type = case_when(
+      sample_type == "stomach" ~ "Stomach",
+      sample_type == "ileum" ~ "Ileum",
+      sample_type == "fecal" ~ "Colon"
+    ),
+    sample_type = factor(sample_type, levels = c("Stomach", "Ileum", "Colon"))
+  )
+
+# --- 1. Fit Model  ---
+
+
+fit_Shannon_t4 <- brm(
+  Shannon ~ treatment * sex * diet + (1 + treatment * sex * diet | sample_type),
+  data = alpha_div_GIT_ST,
+  family = student(),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(exponential(1), class = "sd"),
+    prior(student_t(3, 0, 1), class = "sigma")
+  ), 
+  chains = 4, iter = 4000, warmup = 2000,
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  backend = "cmdstanr",
+  seed = 123
+)
+
+# --- 2. Prediction Grid ---
+newdata_t4 <- tidyr::expand_grid(
+  sample_type = unique(fit_Shannon_t4$data$sample_type),
+  sex         = unique(fit_Shannon_t4$data$sex),
+  treatment   = unique(fit_Shannon_t4$data$treatment),
+  diet        = unique(fit_Shannon_t4$data$diet)
+)
+
+message("Generating predictions...")
+preds_t4 <- tidybayes::add_epred_draws(
+  newdata_t4,
+  fit_Shannon_t4,
+  re_formula = ~ (1 + treatment * sex * diet | sample_type)
+)
+
+# --- CALCULATE EFFECTS WITH 95% AND 80% INTERVALS ---
+
+# A. Global Main Effect: Treatment
+eff_main_treat_t4 <- preds_t4 %>%
+  dplyr::group_by(sample_type, sex, treatment, .draw) %>%
+  dplyr::summarise(epred = mean(.epred), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = treatment, values_from = epred) %>%
+  dplyr::mutate(effect = Hp - Ctrl) %>%
+  dplyr::group_by(sample_type, sex) %>%
+  dplyr::summarise(
+    median    = median(effect),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(type = "Main Effects", label = "Treatment")
+
+# B. Global Main Effect: Diet
+eff_main_diet_t4 <- preds_t4 %>%
+  dplyr::group_by(sample_type, sex, diet, .draw) %>%
+  dplyr::summarise(epred = mean(.epred), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = diet, values_from = epred) %>%
+  dplyr::mutate(effect = HFD - CD) %>%
+  dplyr::group_by(sample_type, sex) %>%
+  dplyr::summarise(
+    median    = median(effect),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(type = "Main Effects", label = "Diet")
+
+# C. Interaction
+eff_interaction_t4 <- preds_t4 %>%
+  dplyr::group_by(sample_type, sex, diet, treatment, .draw) %>%
+  dplyr::summarise(epred = mean(.epred), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = c(treatment, diet), values_from = epred) %>%
+  dplyr::mutate(
+    diff_HFD = Hp_HFD - Ctrl_HFD,
+    diff_CD  = Hp_CD - Ctrl_CD,
+    effect   = diff_HFD - diff_CD
+  ) %>%
+  dplyr::group_by(sample_type, sex) %>%
+  dplyr::summarise(
+    median    = median(effect),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(type = "Interaction", label = "Interaction")
+
+# D. Simple Effects: Treatment WITHIN Diet
+eff_simple_treat_t4 <- preds_t4 %>%
+  dplyr::group_by(sample_type, sex, diet, treatment, .draw) %>%
+  dplyr::summarise(epred = mean(.epred), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = treatment, values_from = epred) %>%
+  dplyr::mutate(effect = Hp - Ctrl) %>%
+  dplyr::group_by(sample_type, sex, diet) %>%
+  dplyr::summarise(
+    median    = median(effect),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(type = "Simple Effects", label = paste("Treatment in", diet))
+
+# E. Simple Effects: Diet WITHIN Treatment
+eff_simple_diet_t4 <- preds_t4 %>%
+  dplyr::group_by(sample_type, sex, diet, treatment, .draw) %>%
+  dplyr::summarise(epred = mean(.epred), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = diet, values_from = epred) %>%
+  dplyr::mutate(effect = HFD - CD) %>%
+  dplyr::group_by(sample_type, sex, treatment) %>%
+  dplyr::summarise(
+    median    = median(effect),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(type = "Simple Effects", label = paste("Diet in", treatment))
+
+# --- COMBINE AND ORDER ---
+plot_data_t4 <- dplyr::bind_rows(
+  eff_main_treat_t4,
+  eff_main_diet_t4,
+  eff_interaction_t4,
+  eff_simple_treat_t4,
+  eff_simple_diet_t4
+) %>%
+  dplyr::mutate(
+    is_sig = (CI_low > 0 | CI_high < 0),
+    label = factor(label, levels = c(
+      "Diet in Hp", "Diet in Ctrl",
+      "Treatment in HFD", "Treatment in CD",
+      "Interaction",
+      "Diet", "Treatment"
+    )),
+    type = factor(type, levels = c("Main Effects", "Interaction", "Simple Effects"))
+  )
+
+# --- CREATE PLOT ---
+dodge_t4 <- position_dodge(width = 0.6)
+
+p_final_t4 <- ggplot2::ggplot(
+  plot_data_t4,
+  ggplot2::aes(x = label, y = median, color = sex)
+) +
+  # 95% CI = thinner outer line
+  ggplot2::geom_linerange(
+    ggplot2::aes(ymin = CI_low, ymax = CI_high),
+    position = dodge_t4,
+    linewidth = 0.8,
+    alpha = 0.65
+  ) +
+  # 80% CI = thicker inner line
+  ggplot2::geom_linerange(
+    ggplot2::aes(ymin = CI80_low, ymax = CI80_high),
+    position = dodge_t4,
+    linewidth = 2.2
+  ) +
+  # median point
+  ggplot2::geom_point(
+    ggplot2::aes(shape = type),
+    position = dodge_t4,
+    size = 2.7
+  ) +
+  ggplot2::geom_hline(yintercept = 0, linetype = "dashed") +
+  ggplot2::coord_flip() +
+  ggplot2::facet_wrap(~ sample_type, nrow = 1) +
+  ggplot2::scale_color_manual(values = c("female" = "#b19cd9", "male" = "#6a0dad")) +
+  ggplot2::scale_shape_manual(values = c(
+    "Main Effects"   = 16,
+    "Interaction"    = 18,
+    "Simple Effects" = 15
+  )) +
+  ggplot2::theme_bw(base_size = 12) +
+  ggplot2::theme(
+    plot.title         = ggplot2::element_text(hjust = 0.5),
+    panel.grid.major.y = ggplot2::element_blank(),
+    axis.text.y        = ggplot2::element_text(color = "black"),
+    strip.text         = ggplot2::element_text(face = "bold")
+  ) +
+  ggplot2::labs(
+    x = "",
+    y = "Effect difference in Shannon diversity",
+    color = "Sex",
+    shape = "Effect Type"
+  )
+
+p_final_t4
+# Save
+ggsave("ST_Shannon_GIT.jpeg", plot = p_final_t4, width = 10, height = 5, units = "in")
+
+```
+
+```{r}
+
+#correlation between shannon index and Hp load in stomach
+df_alpha_hp <- alpha_div_GIT_ST %>%
+  filter(sampletype == "stomach") %>%
+  filter(treatment=="Hp")%>%
+  left_join(MS1_Hp_loads_ST, by = "mouseID") %>%
+  mutate(
+    log10_Hp_copies_std = log10(Hp_copies_std)
+  ) %>%
+  filter(!is.na(Shannon), !is.na(log10_Hp_copies_std))
+
+
+fit_shannon_hp_stomach <- brm(
+  Shannon ~ log10_Hp_copies_std,
+  data = df_alpha_hp,
+  family = gaussian(),
+  prior = c(
+    prior(normal(0, 1), class = "b"),       # slope
+    prior(student_t(3, 0, 1), class = "sigma")
+  ),
+  chains = 4, iter = 4000, warmup = 2000,
+  seed = 123
+)
+
+summary(fit_shannon_hp_stomach)
+posterior <- as_draws_df(fit_shannon_hp_stomach)
+
+mean(posterior$b_log10_Hp_copies_std > 0)  # P(positive)
+mean(posterior$b_log10_Hp_copies_std < 0)  # P(negative)
+
+df_alpha_hp %>%
+  ggplot(aes(x = log10_Hp_copies_std, y = Shannon)) +
+  geom_point(size = 2) +
+  stat_smooth(method = "lm", se = FALSE, color = "#0072B2") +
+  theme_bw() +
+  labs(
+    x = "H. pylori load (log10)",
+    y = "Shannon diversity"
+  )
+
+median(posterior$b_log10_Hp_copies_std)
+
+quantile(posterior$b_log10_Hp_copies_std, probs = c(0.025, 0.975))
+
+```
+
+
+```{r}
+fit_observed_t4 <- brm(
+  Observed ~ treatment * sex * diet + (1 + treatment * sex * diet | sample_type),
+  data = alpha_div_GIT_ST,
+  family = negbinomial(link = "log"),
+  prior = c(
+    prior(normal(0, 1), class = "b"),           # effects on log-mean => exp(b) are ratios
+    #prior(normal(log(mean(alpha_div_GIT_ST$Observed)), 1), class = "Intercept"),
+    prior(exponential(1), class = "sd"),        # RE SDs
+    prior(exponential(1), class = "shape")      # overdispersion
+  ),
+  chains = 4, iter = 4000, warmup = 2000,
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  backend = "cmdstanr",
+  seed = 123
+)
+    
+
+
+# --- 2. Prediction Grid ---
+newdata_t4_ob <- tidyr::expand_grid(
+  sample_type = unique(fit_observed_t4$data$sample_type),
+  sex         = unique(fit_observed_t4$data$sex),
+  treatment   = unique(fit_observed_t4$data$treatment),
+  diet        = unique(fit_observed_t4$data$diet)
+)
+
+message("Generating predictions...")
+preds_t4_ob <- tidybayes::add_epred_draws(
+  newdata_t4_ob,
+  fit_observed_t4,
+  re_formula = ~ (1 + treatment * sex * diet | sample_type)
+)
+
+# --- CALCULATE EFFECTS WITH 95% AND 80% INTERVALS ---
+
+# A. Global Main Effect: Treatment (Hp/Ctrl), averaged across diet
+eff_main_treat_t4_ob <- preds_t4_ob %>%
+  dplyr::group_by(sample_type, sex, treatment, .draw) %>%
+  dplyr::summarise(epred = mean(.epred), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = treatment, values_from = epred) %>%
+  dplyr::mutate(effect = Hp / Ctrl) %>%
+  dplyr::group_by(sample_type, sex) %>%
+  dplyr::summarise(
+    median    = median(effect),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(type = "Main Effects", label = "Treatment")
+
+# B. Global Main Effect: Diet (HFD/CD), averaged across treatment
+eff_main_diet_t4_ob <- preds_t4_ob %>%
+  dplyr::group_by(sample_type, sex, diet, .draw) %>%
+  dplyr::summarise(epred = mean(.epred), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = diet, values_from = epred) %>%
+  dplyr::mutate(effect = HFD / CD) %>%
+  dplyr::group_by(sample_type, sex) %>%
+  dplyr::summarise(
+    median    = median(effect),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(type = "Main Effects", label = "Diet")
+
+# C. Interaction: (Hp/Ctrl in HFD) / (Hp/Ctrl in CD)  (ratio-of-ratios)
+eff_interaction_t4_ob <- preds_t4_ob %>%
+  dplyr::group_by(sample_type, sex, diet, treatment, .draw) %>%
+  dplyr::summarise(epred = mean(.epred), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = c(treatment, diet), values_from = epred) %>%
+  dplyr::mutate(
+    ratio_HFD = Hp_HFD / Ctrl_HFD,
+    ratio_CD  = Hp_CD / Ctrl_CD,
+    effect    = ratio_HFD / ratio_CD
+  ) %>%
+  dplyr::group_by(sample_type, sex) %>%
+  dplyr::summarise(
+    median    = median(effect),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(type = "Interaction", label = "Interaction")
+
+# D. Simple Effects: Treatment within Diet (Hp/Ctrl)
+eff_simple_treat_t4_ob <- preds_t4_ob %>%
+  dplyr::group_by(sample_type, sex, diet, treatment, .draw) %>%
+  dplyr::summarise(epred = mean(.epred), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = treatment, values_from = epred) %>%
+  dplyr::mutate(effect = Hp / Ctrl) %>%
+  dplyr::group_by(sample_type, sex, diet) %>%
+  dplyr::summarise(
+    median    = median(effect),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(type = "Simple Effects", label = paste("Treatment in", diet))
+
+# E. Simple Effects: Diet within Treatment (HFD/CD)
+eff_simple_diet_t4_ob <- preds_t4_ob %>%
+  dplyr::group_by(sample_type, sex, diet, treatment, .draw) %>%
+  dplyr::summarise(epred = mean(.epred), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = diet, values_from = epred) %>%
+  dplyr::mutate(effect = HFD / CD) %>%
+  dplyr::group_by(sample_type, sex, treatment) %>%
+  dplyr::summarise(
+    median    = median(effect),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
+    CI80_low  = quantile(effect, 0.10),
+    CI80_high = quantile(effect, 0.90),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(type = "Simple Effects", label = paste("Diet in", treatment))
+
+# --- COMBINE AND ORDER ---
+plot_data_t4_ob <- dplyr::bind_rows(
+  eff_main_treat_t4_ob,
+  eff_main_diet_t4_ob,
+  eff_interaction_t4_ob,
+  eff_simple_treat_t4_ob,
+  eff_simple_diet_t4_ob
+) %>%
+  dplyr::mutate(
+    is_sig = (CI_low > 1 | CI_high < 1),
+    label = factor(label, levels = c(
+      "Diet in Hp", "Diet in Ctrl",
+      "Treatment in HFD", "Treatment in CD",
+      "Interaction",
+      "Diet", "Treatment"
+    )),
+    type = factor(type, levels = c("Main Effects", "Interaction", "Simple Effects"))
+  )
+
+# --- CREATE PLOT ---
+dodge_t4_ob <- position_dodge(width = 0.6)
+
+p_final_t4_ob <- ggplot2::ggplot(
+  plot_data_t4_ob,
+  ggplot2::aes(x = label, y = median, color = sex)
+) +
+  # 95% CI = thinner outer line
+  ggplot2::geom_linerange(
+    ggplot2::aes(ymin = CI_low, ymax = CI_high),
+    position = dodge_t4_ob,
+    linewidth = 0.8,
+    alpha = 0.65
+  ) +
+  # 80% CI = thicker inner line
+  ggplot2::geom_linerange(
+    ggplot2::aes(ymin = CI80_low, ymax = CI80_high),
+    position = dodge_t4_ob,
+    linewidth = 2.2
+  ) +
+  # median point
+  ggplot2::geom_point(
+    ggplot2::aes(shape = type),
+    position = dodge_t4_ob,
+    size = 2.7
+  ) +
+  ggplot2::geom_hline(yintercept = 1, linetype = "dashed") +
+  ggplot2::coord_flip() +
+  ggplot2::facet_wrap(~ sample_type, nrow = 1) +
+  ggplot2::scale_color_manual(values = c("female" = "#b19cd9", "male" = "#6a0dad")) +
+  ggplot2::scale_shape_manual(values = c(
+    "Main Effects"   = 16,
+    "Interaction"    = 18,
+    "Simple Effects" = 15
+  )) +
+  ggplot2::theme_bw(base_size = 12) +
+  ggplot2::theme(
+    plot.title         = ggplot2::element_text(hjust = 0.5),
+    panel.grid.major.y = ggplot2::element_blank(),
+    axis.text.y        = ggplot2::element_text(color = "black"),
+    strip.text         = ggplot2::element_text(face = "bold")
+  ) +
+  ggplot2::labs(
+    x = "",
+    y = "Effect ratio in observed species",
+    color = "Sex",
+    shape = "Effect Type"
+  )
+
+p_final_t4_ob
+# Save
+ggsave("ST_Observed_GIT.jpeg", plot = p_final_t4_ob, width = 10, height = 5, units = "in")
+    
+    
+```
+
+
+```{r}
+GIT_observed <- p_final_t4_ob +
+  labs(title = "Observed species") +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title.y = element_text(),      # keep y-axis
+    axis.text.y  = element_text(),
+    axis.ticks.y = element_line()
+  )
+
+GIT_shannon <- p_final_t4 +
+  labs(title = "Shannon") +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title.y = element_blank(),
+    axis.text.y  = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+GIT_alpha_composite <- (GIT_observed | GIT_shannon) +
+  plot_layout(guides = "collect") +   # one shared legend
+  plot_annotation(tag_levels = "A") & # A, B
+  theme(
+    legend.position = "bottom",
+    legend.box = "vertical",
+    plot.tag = element_text(face = "bold", size = 14),
+    plot.tag.position = c(0, 1)
+  )
+
+GIT_alpha_composite
+
+# Save
+ggsave("GIT_alpha_composite.jpeg", plot = GIT_alpha_composite, width = 15, height = 5, units = "in")
+```
