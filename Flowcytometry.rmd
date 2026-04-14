@@ -1,7 +1,7 @@
 
 ---
 title: "Flow_cytometry"
-author: "Sigri"
+author: "Sigri & Sandra"
 date: "2023-04-26"
 output: html_document
 ---
@@ -186,13 +186,16 @@ eff_simple_treat <- preds_mac %>%
   mutate(effect = Hp - Ctrl) %>%
   group_by(sex, diet) %>%
   summarise(
-    median    = median(effect),
-    CI95_low  = quantile(effect, 0.025),
-    CI95_high = quantile(effect, 0.975),
-    CI80_low  = quantile(effect, 0.10),
-    CI80_high = quantile(effect, 0.90),
-    .groups   = "drop"
-  ) %>%
+  median    = median(effect),
+  CI_low    = quantile(effect, 0.025),
+  CI_high   = quantile(effect, 0.975),
+  CI80_low  = quantile(effect, 0.10),
+  CI80_high = quantile(effect, 0.90),
+  p_gt0     = mean(effect > 0),
+  p_lt0     = mean(effect < 0),
+  .groups = "drop"
+) %>%
+mutate(post_prob = pmax(p_gt0, p_lt0)) %>%
   mutate(type = "Simple Effects", label = paste("Treatment in", diet))
 
 eff_simple_diet <- preds_mac %>%
@@ -675,12 +678,15 @@ eff_simple_treat <- preds_M1 %>%
   group_by(sex, diet) %>%
   summarise(
     median    = median(effect),
-    CI95_low  = quantile(effect, 0.025),
-    CI95_high = quantile(effect, 0.975),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
     CI80_low  = quantile(effect, 0.10),
     CI80_high = quantile(effect, 0.90),
-    .groups   = "drop"
+    p_gt0     = mean(effect > 0),
+    p_lt0     = mean(effect < 0),
+    .groups = "drop"
   ) %>%
+  mutate(post_prob = pmax(p_gt0, p_lt0)) %>% 
   mutate(type = "Simple Effects", label = paste("Treatment in", diet))
 
 eff_simple_diet <- preds_M1 %>%
@@ -691,12 +697,15 @@ eff_simple_diet <- preds_M1 %>%
   group_by(sex, treatment) %>%
   summarise(
     median    = median(effect),
-    CI95_low  = quantile(effect, 0.025),
-    CI95_high = quantile(effect, 0.975),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
     CI80_low  = quantile(effect, 0.10),
     CI80_high = quantile(effect, 0.90),
-    .groups   = "drop"
+    p_gt0     = mean(effect > 0),
+    p_lt0     = mean(effect < 0),
+    .groups = "drop"
   ) %>%
+  mutate(post_prob = pmax(p_gt0, p_lt0)) %>% 
   mutate(type = "Simple Effects", label = paste("Diet in", treatment))
 
 # --- 4. COMBINE AND FORMAT ---
@@ -922,12 +931,15 @@ eff_simple_treat <- preds_ratio %>%
   group_by(sex, diet) %>%
   summarise(
     median    = median(effect),
-    CI95_low  = quantile(effect, 0.025),
-    CI95_high = quantile(effect, 0.975),
+    CI_low    = quantile(effect, 0.025),
+    CI_high   = quantile(effect, 0.975),
     CI80_low  = quantile(effect, 0.10),
     CI80_high = quantile(effect, 0.90),
-    .groups   = "drop"
+    p_gt0     = mean(effect > 0),
+    p_lt0     = mean(effect < 0),
+    .groups = "drop"
   ) %>%
+  mutate(post_prob = pmax(p_gt0, p_lt0)) %>% 
   mutate(type = "Simple Effects", label = paste("Treatment in", diet))
 
 eff_simple_diet <- preds_ratio %>%
