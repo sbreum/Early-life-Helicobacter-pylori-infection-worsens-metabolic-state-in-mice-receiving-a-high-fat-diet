@@ -1,0 +1,2024 @@
+
+```{r}
+### Load required packages
+library(ggplot2)
+library(phyloseq)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(purrr)
+library(speedyseq)
+library(brms)
+library(tidybayes)
+library(emmeans)
+library(compositions)
+library(fantaxtic)
+library(ggh4x)
+library(ggpubr)
+library(cowplot)
+library(patchwork)
+```
+
+```{r}
+# ============================================================
+# SHARED OBJECTS
+# ============================================================
+
+safe_brm <- purrr::safely(brms::brm)
+
+sex_cols <- c(
+  female = "#b19cd9",
+  male   = "#6a0dad"
+)
+
+sex_sig_cols <- c(
+  female_sig    = "#b19cd9",
+  male_sig      = "#6a0dad",
+  female_nonsig = "#d9d9d9",
+  male_nonsig   = "#8c8c8c"
+)
+
+treatment_cols <- c(
+  Ctrl = "#0072B2",
+  Hp   = "#E69F00"
+)
+
+priors <- c(
+  prior(normal(0, 0.5), class = "b"),
+  prior(exponential(1), class = "sd"),
+  prior(student_t(3, 0, 1), class = "sigma")
+)
+
+# ============================================================
+# SHARED HELPERS
+# ============================================================
+
+rename_eub_family <- function(ps, rank = "Family") {
+  if (rank == "Family") {
+    ps %>%
+      mutate_tax_table(
+        Family = ifelse(
+          Family == "[Eubacterium] coprostanoligenes group",
+          "Eub. coprostanoligenes gr.",
+          Family
+        )
+      )
+  } else if (rank == "Genus") {
+    ps %>%
+      mutate_tax_table(
+        Genus = ifelse(
+          Genus == "[Eubacterium] coprostanoligenes group",
+          "Eub. coprostanoligenes gr.",
+          Genus
+        )
+      )
+  } else {
+    ps
+  }
+}
+
+rename_phyla <- function(ps) {
+  ps %>%
+    mutate_tax_table(
+      Phylum = if_else(Phylum == "Firmicutes", "Bacillota", Phylum),
+      Phylum = if_else(Phylum == "Proteobacteria", "Pseudomonadota", Phylum),
+      Phylum = if_else(Phylum == "Actinobacteria", "Actinomycetota", Phylum)
+    )
+}
+
+load_comp_physeq <- function(path) {
+  readRDS(path) %>%
+    subset_samples(!is.na(treatment)) %>%
+    rename_phyla() %>%
+    mutate_sample_data(seqSampleID = sample_names(.))
+}
+
+make_tax_names_unique <- function(ps, tax_level = "Family") {
+  tax_names <- as.character(tax_table(ps)[, tax_level])
+  tax_names[is.na(tax_names) | tax_names == ""] <- paste0("Unknown_", tax_level)
+  taxa_names(ps) <- make.unique(tax_names)
+  ps
+}
+
+make_family_clr_df <- function(physeq_obj,
+                               sample_filter,
+                               prevalence_threshold = 0.10,
+                               max_abundance_threshold = 0.001) {
+  filter_expr <- substitute(sample_filter)
+  sample_df <- data.frame(sample_data(physeq_obj))
+  keep_samples <- eval(filter_expr, sample_df, parent.frame())
+
+  physeq_sub <- prune_samples(keep_samples, physeq_obj) %>%
+    rename_eub_family(rank = "Family")
+
+  physeq_fam <- phyloseq::tax_glom(physeq_sub, taxrank = "Family") %>%
+    make_tax_names_unique("Family")
+
+  otu_rel <- as(otu_table(physeq_fam), "matrix")
+  if (!taxa_are_rows(physeq_fam)) otu_rel <- t(otu_rel)
+
+  family_prevalence <- rowMeans(otu_rel > 0)
+  family_max_abund  <- apply(otu_rel, 1, max)
+
+  keep_families <- names(family_prevalence[
+    family_prevalence >= prevalence_threshold &
+      family_max_abund >= max_abundance_threshold
+  ])
+
+  physeq_fam <- prune_taxa(keep_families, physeq_fam)
+
+  otu_rel <- as(otu_table(physeq_fam), "matrix")
+  if (!taxa_are_rows(physeq_fam)) otu_rel <- t(otu_rel)
+
+  min_nonzero <- min(otu_rel[otu_rel > 0])
+  otu_rel_pc <- otu_rel + min_nonzero / 2
+  otu_rel_pc <- sweep(otu_rel_pc, 2, colSums(otu_rel_pc), "/")
+  otu_clr <- apply(otu_rel_pc, 2, compositions::clr)
+
+  physeq_clr <- phyloseq(
+    otu_table(otu_clr, taxa_are_rows = TRUE),
+    tax_table(physeq_fam),
+    sample_data(physeq_fam)
+  )
+
+  clr_df <- as.data.frame(otu_clr) %>%
+    tibble::rownames_to_column("Family") %>%
+    tidyr::pivot_longer(-Family, names_to = "Sample", values_to = "CLR") %>%
+    dplyr::left_join(
+      data.frame(sample_data(physeq_fam)) %>%
+        tibble::rownames_to_column("Sample"),
+      by = "Sample"
+    )
+
+  list(
+    physeq_family = physeq_fam,
+    physeq_clr = physeq_clr,
+    clr_df = clr_df,
+    kept_families = keep_families
+  )
+}
+
+clr_phyloseq <- function(ps, tax_level = "Family") {
+  ps <- rename_eub_family(ps, rank = tax_level)
+  ps_glom <- tax_glom(ps, taxrank = tax_level) %>%
+    make_tax_names_unique(tax_level)
+
+  otu <- as(otu_table(ps_glom), "matrix")
+  if (!taxa_are_rows(ps_glom)) otu <- t(otu)
+
+  min_nonzero <- min(otu[otu > 0])
+  otu_pc <- otu + min_nonzero / 2
+  otu_pc <- sweep(otu_pc, 2, colSums(otu_pc), "/")
+  otu_clr <- apply(otu_pc, 2, compositions::clr)
+
+  phyloseq(
+    otu_table(otu_clr, taxa_are_rows = TRUE),
+    tax_table(ps_glom),
+    sample_data(ps_glom)
+  )
+}
+
+ps_clr_to_long <- function(ps_clr, tax_level = "Family") {
+  psmelt(ps_clr) %>%
+    rename(CLR = Abundance) %>%
+    mutate(
+      sex = factor(sex),
+      treatment = factor(treatment),
+      diet = factor(diet),
+      !!tax_level := factor(.data[[tax_level]])
+    )
+}
+
+make_rel_abund_df <- function(ps, tax_level = "Family", pseudocount = TRUE) {
+  df <- ps %>%
+    rename_eub_family(rank = tax_level) %>%
+    phyloseq::tax_glom(taxrank = tax_level) %>%
+    psmelt() %>%
+    mutate(
+      !!tax_level := ifelse(
+        is.na(.data[[tax_level]]) | .data[[tax_level]] == "",
+        paste0("Unknown_", tax_level),
+        as.character(.data[[tax_level]])
+      )
+    )
+
+  if (pseudocount) {
+    min_nonzero <- min(df$Abundance[df$Abundance > 0], na.rm = TRUE)
+
+    df <- df %>%
+      mutate(
+        pseudocount = min_nonzero / 2,
+        Abundance_pseudocount = Abundance + pseudocount,
+        abund_log10 = log10(Abundance_pseudocount)
+      ) %>%
+      select(-pseudocount)
+  }
+
+  df
+}
+
+fit_family_models <- function(clr_df, time_levels, priors) {
+  model_df <- clr_df %>%
+    mutate(
+      timepoint = factor(timepoint, levels = time_levels),
+      sex = droplevels(factor(sex)),
+      treatment = droplevels(factor(treatment)),
+      Family = droplevels(factor(Family))
+    ) %>%
+    filter(is.finite(CLR))
+
+  family_ids <- unique(model_df$Family)
+
+  fit_models <- family_ids |>
+    set_names() |>
+    purrr::map(function(fam) {
+      df_family <- model_df %>%
+        filter(Family == fam) %>%
+        droplevels()
+
+      safe_brm(
+        CLR ~ treatment * sex * timepoint + (1 | mouseID),
+        data = df_family,
+        family = student(),
+        prior = priors,
+        chains = 4,
+        iter = 4000,
+        warmup = 2000,
+        backend = "cmdstanr",
+        control = list(adapt_delta = 0.99, max_treedepth = 15)
+      )
+    })
+
+  list(
+    model_df = model_df,
+    fit_models = fit_models
+  )
+}
+
+extract_family_treatment_contrasts <- function(fit_models, time_levels) {
+  plot_data <- purrr::imap_dfr(
+    fit_models,
+    function(fit, fam) {
+      if (is.null(fit$result)) return(NULL)
+
+      emm <- emmeans(fit$result, ~ treatment | sex * timepoint)
+      emm_contr <- contrast(emm, method = "revpairwise")
+
+      contr80 <- summary(emm_contr, level = 0.80) %>% as.data.frame()
+      contr95 <- summary(emm_contr, level = 0.95) %>% as.data.frame()
+      draws <- tidybayes::gather_emmeans_draws(emm_contr)
+
+      prob_df <- draws %>%
+        group_by(contrast, sex, timepoint) %>%
+        summarise(
+          p_gt0 = mean(.value > 0),
+          p_lt0 = mean(.value < 0),
+          prob_dir = pmax(p_gt0, p_lt0),
+          .groups = "drop"
+        )
+
+      contr80 %>%
+        transmute(
+          Family = fam,
+          sex,
+          timepoint,
+          contrast,
+          median = estimate,
+          CI80_low = lower.HPD,
+          CI80_high = upper.HPD
+        ) %>%
+        left_join(
+          contr95 %>%
+            transmute(
+              contrast,
+              sex,
+              timepoint,
+              CI95_low = lower.HPD,
+              CI95_high = upper.HPD
+            ),
+          by = c("contrast", "sex", "timepoint")
+        ) %>%
+        left_join(prob_df, by = c("contrast", "sex", "timepoint"))
+    }
+  )
+
+  plot_data %>%
+    mutate(
+      timepoint = factor(as.character(timepoint), levels = time_levels),
+      is_sig80 = (CI80_low > 0 | CI80_high < 0),
+      is_sig95 = (CI95_low > 0 | CI95_high < 0)
+    ) %>%
+    filter(!is.na(timepoint))
+}
+
+plot_family_treatment_effects <- function(plot_data,
+                                          time_levels,
+                                          ylab = "Hp − Ctrl effect (CLR)") {
+  plot_data <- plot_data %>%
+    filter(!is.na(timepoint)) %>%
+    mutate(timepoint = factor(as.character(timepoint), levels = time_levels))
+
+  ggplot(plot_data, aes(x = timepoint, y = median, group = sex, color = sex)) +
+    geom_hline(yintercept = 0, color = "#333333", linewidth = 0.6) +
+    geom_line(linewidth = 1) +
+    geom_errorbar(
+      aes(ymin = CI80_low, ymax = CI80_high),
+      width = 0.15,
+      linewidth = 0.4
+    ) +
+    geom_point(size = 1.3) +
+    geom_point(
+      data = ~ dplyr::filter(.x, is_sig80),
+      shape = 21,
+      stroke = 0.7,
+      fill = "white",
+      color = "black",
+      size = 2.8
+    ) +
+    geom_point(
+      data = ~ dplyr::filter(.x, is_sig95),
+      color = "black",
+      size = 0.9,
+      show.legend = FALSE
+    ) +
+    facet_wrap(~ Family, scales = "free_y", ncol = 4) +
+    scale_color_manual(values = sex_cols) +
+    scale_x_discrete(drop = TRUE) +
+    theme_bw(base_size = 11) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      strip.text = element_text(face = "bold"),
+      legend.position = "bottom"
+    ) +
+    labs(
+      x = "",
+      y = ylab,
+      color = "Sex"
+    )
+}
+
+run_microbiome_model <- function(df, tax_level = "Family", prior_spec = priors) {
+  form <- as.formula(
+    paste0(
+      "CLR ~ sex * treatment * diet + ",
+      "(1 + sex * treatment * diet || ", tax_level, ")"
+    )
+  )
+
+  brm(
+    formula = form,
+    data = df,
+    family = student(),
+    prior = prior_spec,
+    chains = 4,
+    iter = 4000,
+    warmup = 2000,
+    backend = "cmdstanr",
+    control = list(adapt_delta = 0.99, max_treedepth = 15)
+  )
+}
+
+run_microbiome_model_no_diet <- function(df, tax_level = "Family", prior_spec = priors) {
+  form <- as.formula(
+    paste0(
+      "CLR ~ sex * treatment + ",
+      "(1 + sex * treatment || ", tax_level, ")"
+    )
+  )
+
+  brm(
+    formula = form,
+    data = df,
+    prior = prior_spec,
+    family = gaussian(),
+    backend = "cmdstanr"
+  )
+}
+
+make_simple_effect_plot <- function(plot_df, title = NULL) {
+  ggplot(plot_df, aes(x = label, y = median, color = color_group)) +
+    geom_linerange(
+      aes(ymin = CI_low, ymax = CI_high),
+      position = position_dodge(width = 0.6),
+      linewidth = 0.5
+    ) +
+    geom_linerange(
+      aes(ymin = CI80_low, ymax = CI80_high),
+      position = position_dodge(width = 0.6),
+      linewidth = 1.8
+    ) +
+    geom_point(
+      position = position_dodge(width = 0.6),
+      size = 1.8
+    ) +
+    geom_point(
+      data = ~ dplyr::filter(.x, is_sig80),
+      position = position_dodge(width = 0.6),
+      shape = 21,
+      stroke = 0.7,
+      fill = "white",
+      color = "black",
+      size = 2.8
+    ) +
+    geom_point(
+      data = ~ dplyr::filter(.x, is_sig95),
+      position = position_dodge(width = 0.6),
+      color = "black",
+      size = 0.9,
+      show.legend = FALSE
+    ) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    coord_flip() +
+    facet_grid(rows = vars(Family)) +
+    scale_color_manual(values = sex_sig_cols) +
+    theme_bw(base_size = 11) +
+    theme(
+      panel.grid.major.y = element_blank(),
+      axis.text.y = element_text(color = "black", size = 8),
+      strip.text.y = element_text(face = "bold"),
+      legend.position = "bottom"
+    ) +
+    labs(
+      x = "",
+      y = "Effect estimate (CLR difference)",
+      color = "Sex / Evidence",
+      title = title
+    )
+}
+
+clean_sample_id <- function(x) {
+  x %>%
+    stringr::str_remove("\\.sto$") %>%
+    stringr::str_replace("\\.FL$", "_FL") %>%
+    stringr::str_replace("\\.FN$", "_FN") %>%
+    stringr::str_replace("\\.FR$", "_FR") %>%
+    stringr::str_replace("\\.FB$", "_FB") %>%
+    stringr::str_replace("\\.ML$", "_MN") %>%
+    stringr::str_replace("\\.MR$", "_MR")
+}
+
+make_target_family_plot_list <- function(df_target, family_order) {
+  df_plot <- df_target %>%
+    mutate(
+      abund_log10 = log10(Abundance + 1e-5),
+      x_group = factor(
+        paste(diet, treatment, sep = "_"),
+        levels = c("CD_Ctrl", "CD_Hp", "HFD_Ctrl", "HFD_Hp")
+      )
+    )
+
+  family_plots <- df_plot %>%
+    split(.$Family) %>%
+    purrr::imap(~ ggplot(.x, aes(x = x_group, y = abund_log10, color = treatment)) +
+      geom_boxplot(
+        aes(fill = treatment),
+        alpha = 0.1,
+        outlier.shape = NA,
+        linewidth = 0.5,
+        show.legend = FALSE
+      ) +
+      geom_jitter(height = 0, width = 0.12, size = 1, alpha = 0.6) +
+      facet_wrap(~ sex) +
+      scale_y_continuous(
+        limits = c(-5.1, 0.2),
+        breaks = c(-5, -4, -3, -2, -1, 0)
+      ) +
+      scale_colour_manual(
+        labels = c("Control", expression(italic("H. pylori"))),
+        values = treatment_cols
+      ) +
+      scale_fill_manual(
+        labels = c("Control", expression(italic("H. pylori"))),
+        values = treatment_cols
+      ) +
+      scale_x_discrete(labels = NULL) +
+      annotate("text", x = 1.5, y = 0.15, label = "CD", size = 4, fontface = "bold") +
+      annotate("text", x = 3.5, y = 0.15, label = "HFD", size = 4, fontface = "bold") +
+      geom_vline(xintercept = 2.5, linetype = "dashed", color = "grey70") +
+      labs(
+        x = "",
+        y = expression(Log[10] ~ "rel. abundance"),
+        title = .y
+      ) +
+      theme_bw() +
+      theme(
+        panel.background = element_rect(fill = "white"),
+        plot.background  = element_rect(fill = "white"),
+        strip.background = element_blank(),
+        panel.grid = element_blank(),
+        axis.text.y = element_text(size = 12),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        strip.text = element_text(size = 12),
+        plot.title = element_text(hjust = 0.5, size = 12, face = "bold"),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        legend.text = element_text(size = 12)
+      ) +
+      guides(color = guide_legend(override.aes = list(size = 3)))
+    )
+
+  family_plots_clean <- family_plots[intersect(family_order, names(family_plots))]
+  family_plots_clean
+}
+
+assemble_family_patchwork <- function(family_plots_clean, ncol = 3, nrow = NULL) {
+  keep_y <- seq(1, length(family_plots_clean), by = ncol)
+
+  for (i in seq_along(family_plots_clean)) {
+    if (!(i %in% keep_y)) {
+      family_plots_clean[[i]] <- family_plots_clean[[i]] +
+        theme(
+          axis.title.y = element_blank(),
+          axis.text.y  = element_blank(),
+          axis.ticks.y = element_blank()
+        )
+    }
+  }
+
+  wrap_plots(
+    family_plots_clean,
+    ncol = ncol,
+    nrow = nrow
+  ) +
+    plot_layout(guides = "collect") &
+    theme(legend.position = "bottom")
+}
+
+make_top10_nested_bar <- function(ps_obj, facet_formula) {
+  plot_nested_bar(
+    ps_obj = ps_obj,
+    top_level = "Phylum",
+    nested_level = "Family",
+    palette = c(
+      Bacillota = "#00F034",
+      Bacteroidota = "#008CF0",
+      Campylobacterota = "#E69F00",
+      Desulfobacterota = "#ECF000",
+      Verrucomicrobiota = "#CA0BE8"
+    )
+  ) +
+    labs(x = "Mouse ID", y = "Relative abundance") +
+    facet_nested(
+      facet_formula,
+      nest_line = element_line(linetype = 1),
+      scales = "free_x",
+      space = "free",
+      labeller = labeller(
+        treatment = c("Ctrl" = "Control", "Hp" = "italic('H. pylori')"),
+        .default = label_parsed
+      )
+    ) +
+    theme(
+      axis.title.x = element_text(size = 12),
+      axis.title.y = element_text(size = 12),
+      axis.text.x = element_blank(),
+      axis.text.y = element_text(size = 12),
+      axis.ticks.length.x = unit(0.3, "cm"),
+      strip.background.x = element_rect(fill = "white"),
+      strip.text.x = element_text(color = "black", size = 12),
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      legend.position = "right",
+      legend.title = element_blank(),
+      legend.key.size = unit(0.5, "cm"),
+      panel.spacing = unit(0.75, "lines"),
+      panel.border = element_rect(color = "white", fill = NA, size = 0.5)
+    )
+}
+
+```
+
+```{r}
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+
+physeq_ST_comp <- load_comp_physeq("/Users/sandra/Desktop/Klove_obesity_neonatal/ST_physeq_trans_pruned_0.001.rds")
+physeq_LT_comp <- load_comp_physeq("/Users/sandra/Desktop/Klove_obesity_neonatal/LT_physeq_trans_pruned_0.001.rds")
+
+MS1_Hp_loads <- read_xlsx("MS1_Hp_loads.xlsx") %>%
+  select(mouseID, experiment, total_bact_load, avg_copies, total_Hp_abund, total_DNA_conc, Hp_copies_std) 
+
+# subset Hp loads data by experiment
+MS1_Hp_loads_LT <- MS1_Hp_loads %>% 
+  filter(experiment == "LT") %>%
+  select(-experiment)
+MS1_Hp_loads_ST <- MS1_Hp_loads %>% 
+  filter(experiment == "ST") %>%
+  select(-experiment)
+
+```
+
+```{r}
+
+# ============================================================
+# SHORT-TERM EXPERIMENT, fecal samples
+# ============================================================
+
+# ---------- Baseline before diet change ----------
+st_baseline_obj <- make_family_clr_df(
+  physeq_obj = physeq_ST_comp,
+  sample_filter = weeks_on_diet %in% c(-2, 0),
+  prevalence_threshold = 0.10,
+  max_abundance_threshold = 0.001
+)
+
+clr_ST_fam_df_baseline <- st_baseline_obj$clr_df
+
+st_baseline_fit <- fit_family_models(
+  clr_df = clr_ST_fam_df_baseline,
+  time_levels = c("t0", "t1"),
+  priors = priors
+)
+
+df_effects_ST_baseline <- extract_family_treatment_contrasts(
+  fit_models = st_baseline_fit$fit_models,
+  time_levels = c("t0", "t1")
+)
+
+p_family_treatment_effect_lines_baseline <- plot_family_treatment_effects(
+  plot_data = df_effects_ST_baseline,
+  time_levels = c("t0", "t1")
+)
+
+p_family_treatment_effect_lines_baseline
+
+# ---------- Fecal samples one week after diet change ----------
+st_fecal3_obj <- make_family_clr_df(
+  physeq_obj = physeq_ST_comp,
+  sample_filter = weeks_on_diet == 1,
+  prevalence_threshold = 0.10,
+  max_abundance_threshold = 0.001
+)
+
+clr_ST_fam_df_fecal3 <- st_fecal3_obj$clr_df
+
+priors_fecal3 <- c(
+  prior(normal(0, 1), class = "b"),
+  prior(student_t(3, 0, 2.5), class = "Intercept"),
+  prior(student_t(3, 0, 1), class = "sigma")
+)
+
+fecal3_fam_clr <- clr_ST_fam_df_fecal3 %>%
+  mutate(
+    Family = droplevels(factor(Family)),
+    sex = droplevels(factor(sex, levels = c("female", "male"))),
+    treatment = droplevels(factor(treatment, levels = c("Ctrl", "Hp"))),
+    diet = droplevels(factor(diet, levels = c("CD", "HFD")))
+  ) %>%
+  filter(is.finite(CLR))
+
+family_ids_fecal3 <- unique(fecal3_fam_clr$Family)
+
+fit_models_by_family_fecal3 <- family_ids_fecal3 |>
+  set_names() |>
+  purrr::map(function(fam) {
+    df_family <- fecal3_fam_clr %>%
+      filter(Family == fam) %>%
+      droplevels()
+
+    enough_levels <- (
+      dplyr::n_distinct(df_family$sex) >= 2 &&
+      dplyr::n_distinct(df_family$treatment) >= 2 &&
+      dplyr::n_distinct(df_family$diet) >= 2
+    )
+
+    if (!enough_levels) {
+      return(list(
+        result = NULL,
+        error = simpleError("Insufficient factor levels for full model")
+      ))
+    }
+
+    safe_brm(
+      CLR ~ treatment * diet + sex,
+      data = df_family,
+      family = student(),
+      prior = priors_fecal3,
+      chains = 4,
+      iter = 4000,
+      warmup = 2000,
+      backend = "cmdstanr",
+      control = list(adapt_delta = 0.99, max_treedepth = 15)
+    )
+  })
+
+extract_fecal3_simple_effects <- function(fit_models) {
+  diet_effects <- purrr::imap_dfr(
+    fit_models,
+    function(fit, fam) {
+      if (is.null(fit$result)) return(NULL)
+
+      emm <- emmeans::emmeans(fit$result, ~ diet | sex * treatment)
+      emm_contr <- emmeans::contrast(emm, method = "revpairwise")
+
+      summ80 <- summary(emm_contr, level = 0.80) %>% as.data.frame()
+      summ95 <- summary(emm_contr, level = 0.95) %>% as.data.frame()
+      draws  <- tidybayes::gather_emmeans_draws(emm_contr)
+
+      prob_df <- draws %>%
+        dplyr::group_by(contrast, sex, treatment) %>%
+        dplyr::summarise(
+          p_gt0 = mean(.value > 0),
+          p_lt0 = mean(.value < 0),
+          Pd = pmax(p_gt0, p_lt0),
+          .groups = "drop"
+        )
+
+      summ80 %>%
+        dplyr::transmute(
+          contrast, sex, treatment,
+          median = estimate,
+          CI80_low = lower.HPD,
+          CI80_high = upper.HPD
+        ) %>%
+        dplyr::left_join(
+          summ95 %>%
+            dplyr::transmute(
+              contrast, sex, treatment,
+              CI95_low = lower.HPD,
+              CI95_high = upper.HPD
+            ),
+          by = c("contrast", "sex", "treatment")
+        ) %>%
+        dplyr::left_join(prob_df, by = c("contrast", "sex", "treatment")) %>%
+        dplyr::mutate(
+          Family = fam,
+          label = paste0("Diet in ", treatment),
+          type = "Simple Effects"
+        ) %>%
+        dplyr::transmute(
+          Family, sex, median,
+          CI_low = CI95_low,
+          CI_high = CI95_high,
+          CI80_low, CI80_high,
+          CI95_low, CI95_high,
+          Pd, label, type
+        )
+    }
+  )
+
+  treatment_effects <- purrr::imap_dfr(
+    fit_models,
+    function(fit, fam) {
+      if (is.null(fit$result)) return(NULL)
+
+      emm <- emmeans::emmeans(fit$result, ~ treatment | sex * diet)
+      emm_contr <- emmeans::contrast(emm, method = "revpairwise")
+
+      summ80 <- summary(emm_contr, level = 0.80) %>% as.data.frame()
+      summ95 <- summary(emm_contr, level = 0.95) %>% as.data.frame()
+      draws  <- tidybayes::gather_emmeans_draws(emm_contr)
+
+      prob_df <- draws %>%
+        dplyr::group_by(contrast, sex, diet) %>%
+        dplyr::summarise(
+          p_gt0 = mean(.value > 0),
+          p_lt0 = mean(.value < 0),
+          Pd = pmax(p_gt0, p_lt0),
+          .groups = "drop"
+        )
+
+      summ80 %>%
+        dplyr::transmute(
+          contrast, sex, diet,
+          median = estimate,
+          CI80_low = lower.HPD,
+          CI80_high = upper.HPD
+        ) %>%
+        dplyr::left_join(
+          summ95 %>%
+            dplyr::transmute(
+              contrast, sex, diet,
+              CI95_low = lower.HPD,
+              CI95_high = upper.HPD
+            ),
+          by = c("contrast", "sex", "diet")
+        ) %>%
+        dplyr::left_join(prob_df, by = c("contrast", "sex", "diet")) %>%
+        dplyr::mutate(
+          Family = fam,
+          label = paste0("Treatment in ", diet),
+          type = "Simple Effects"
+        ) %>%
+        dplyr::transmute(
+          Family, sex, median,
+          CI_low = CI95_low,
+          CI_high = CI95_high,
+          CI80_low, CI80_high,
+          CI95_low, CI95_high,
+          Pd, label, type
+        )
+    }
+  )
+
+  dplyr::bind_rows(treatment_effects, diet_effects) %>%
+    dplyr::mutate(
+      is_sig80 = (CI80_low > 0 | CI80_high < 0),
+      is_sig95 = (CI95_low > 0 | CI95_high < 0),
+      color_group = dplyr::case_when(
+        is_sig80 & sex == "female"  ~ "female_sig",
+        is_sig80 & sex == "male"    ~ "male_sig",
+        !is_sig80 & sex == "female" ~ "female_nonsig",
+        !is_sig80 & sex == "male"   ~ "male_nonsig"
+      )
+    )
+}
+
+plot_df_simple_fecal3 <- extract_fecal3_simple_effects(fit_models_by_family_fecal3)
+
+top_fams_simple_fecal3 <- plot_df_simple_fecal3 %>%
+  dplyr::group_by(Family) %>%
+  dplyr::summarise(max_abs = max(abs(median)), .groups = "drop") %>%
+  dplyr::arrange(desc(max_abs)) %>%
+  dplyr::slice_head(n = 10) %>%
+  dplyr::pull(Family)
+
+plot_df_simple_fecal3 <- plot_df_simple_fecal3 %>%
+  dplyr::filter(Family %in% top_fams_simple_fecal3) %>%
+  dplyr::mutate(
+    Family = factor(Family, levels = top_fams_simple_fecal3),
+    label = factor(
+      label,
+      levels = c(
+        "Diet in Hp",
+        "Diet in Ctrl",
+        "Treatment in HFD",
+        "Treatment in CD"
+      )
+    )
+  )
+
+p_simple_fecal3 <- make_simple_effect_plot(
+  plot_df_simple_fecal3,
+  title = "One week after diet change"
+)
+
+p_simple_fecal3
+
+```
+
+```{r}
+
+
+# ---------- ST gastrointestinal sites at termination ----------
+physeq_ST_comp_git <- physeq_ST_comp %>%
+  subset_samples(timepoint == "t4") %>%
+  rename_eub_family(rank = "Family")
+
+models_site <- list()
+dfs_site <- list()
+ps_clr_site <- list()
+
+for (site in c("stomach", "ileum", "colon")) {
+  cat("Running site:", site, "\n")
+
+  ps_site <- subset_samples(physeq_ST_comp_git, sample_type == site)
+  ps_clr  <- clr_phyloseq(ps_site, tax_level = "Family")
+  df_site <- ps_clr_to_long(ps_clr, tax_level = "Family")
+  model   <- run_microbiome_model(df_site, tax_level = "Family")
+
+  ps_clr_site[[site]] <- ps_clr
+  dfs_site[[site]] <- df_site
+  models_site[[site]] <- model
+}
+
+site_plots_simple <- list()
+site_simple_tables <- list()
+
+for (site in names(models_site)) {
+  df_site <- dfs_site[[site]]
+  model_site <- models_site[[site]]
+
+  grid_site <- tidyr::expand_grid(
+    Family    = levels(df_site$Family),
+    sex       = levels(df_site$sex),
+    treatment = levels(df_site$treatment),
+    diet      = levels(df_site$diet)
+  )
+
+  preds_site <- model_site %>%
+    add_epred_draws(newdata = grid_site, ndraws = 2000, re_formula = NULL)
+
+  eff_simple_treat <- preds_site %>%
+    group_by(.draw, Family, sex, diet, treatment) %>%
+    summarise(mu = mean(.epred), .groups = "drop") %>%
+    pivot_wider(names_from = treatment, values_from = mu) %>%
+    mutate(effect = Hp - Ctrl) %>%
+    group_by(Family, sex, diet) %>%
+    summarise(
+      median   = median(effect),
+      CI_low   = quantile(effect, 0.025),
+      CI_high  = quantile(effect, 0.975),
+      CI80_low = quantile(effect, 0.10),
+      CI80_high= quantile(effect, 0.90),
+      Pd       = pmax(mean(effect > 0), mean(effect < 0)),
+      .groups = "drop"
+    ) %>%
+    mutate(label = paste0("Treatment in ", diet), type = "Simple Effects")
+
+  eff_simple_diet <- preds_site %>%
+    group_by(.draw, Family, sex, treatment, diet) %>%
+    summarise(mu = mean(.epred), .groups = "drop") %>%
+    pivot_wider(names_from = diet, values_from = mu) %>%
+    mutate(effect = HFD - CD) %>%
+    group_by(Family, sex, treatment) %>%
+    summarise(
+      median   = median(effect),
+      CI_low   = quantile(effect, 0.025),
+      CI_high  = quantile(effect, 0.975),
+      CI80_low = quantile(effect, 0.10),
+      CI80_high= quantile(effect, 0.90),
+      Pd       = pmax(mean(effect > 0), mean(effect < 0)),
+      .groups = "drop"
+    ) %>%
+    mutate(label = paste0("Diet in ", treatment), type = "Simple Effects")
+
+  plot_df_simple <- bind_rows(eff_simple_treat, eff_simple_diet) %>%
+  mutate(
+    site = site,
+    is_sig80 = (CI80_low > 0 & CI80_high > 0) | (CI80_low < 0 & CI80_high < 0),
+    is_sig95 = (CI_low > 0 & CI_high > 0) | (CI_low < 0 & CI_high < 0),
+    color_group = case_when(
+      is_sig80 & sex == "female"  ~ "female_sig",
+      is_sig80 & sex == "male"    ~ "male_sig",
+      !is_sig80 & sex == "female" ~ "female_nonsig",
+      !is_sig80 & sex == "male"   ~ "male_nonsig"
+    )
+  )
+  
+  fam_order <- plot_df_simple %>%
+    group_by(Family) %>%
+    summarise(max_abs = max(abs(median)), .groups = "drop") %>%
+    arrange(desc(max_abs)) %>%
+    slice_head(n = 10) %>%
+    pull(Family)
+
+  plot_df_simple <- plot_df_simple %>%
+    filter(Family %in% fam_order) %>%
+    mutate(
+      Family = factor(Family, levels = fam_order),
+      label = factor(
+        label,
+        levels = c(
+          "Diet in Hp",
+          "Diet in Ctrl",
+          "Treatment in HFD",
+          "Treatment in CD"
+        )
+      )
+    )
+
+  site_simple_tables[[site]] <- plot_df_simple
+  site_plots_simple[[site]] <- make_simple_effect_plot(plot_df_simple, title = site)
+}
+
+site_plots_simple$stomach
+site_plots_simple$ileum
+site_plots_simple$colon
+
+```
+
+```{r}
+# ---------- ST Helicobacteraceae abundance vs Hp load ----------
+phy_stomach_hp <- physeq_ST_comp_git %>%
+  subset_samples(sample_type == "stomach" & treatment == "Hp") %>%
+  transform_sample_counts(function(x) x / sum(x))
+
+phy_family <- tax_glom(phy_stomach_hp, taxrank = "Family")
+
+hel_df <- psmelt(phy_family) %>%
+  filter(Family == "Helicobacteraceae") %>%
+  select(Sample, Abundance) %>%
+  mutate(sample_ID_clean = clean_sample_id(Sample))
+
+meta_df <- data.frame(sample_data(phy_stomach_hp)) %>%
+  tibble::rownames_to_column("Sample") %>%
+  mutate(sample_ID_clean = clean_sample_id(Sample))
+
+hel_df <- hel_df %>%
+  inner_join(meta_df, by = "sample_ID_clean") %>%
+  inner_join(MS1_Hp_loads_ST, by = "mouseID") %>%
+  mutate(log10_Hp = log10(Hp_copies_std.x))
+
+fit_relabund_hp <- brm(
+  Abundance ~ log10_Hp,
+  data = hel_df,
+  family = gaussian(),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(student_t(3, 0, 1), class = "sigma")
+  ),
+  chains = 4, iter = 4000, warmup = 2000,
+  seed = 123
+)
+
+posterior <- as_draws_df(fit_relabund_hp)
+
+posterior %>%
+  summarise(
+    median = median(b_log10_Hp),
+    CI_low = quantile(b_log10_Hp, 0.025),
+    CI_high = quantile(b_log10_Hp, 0.975),
+    prob_pos = mean(b_log10_Hp > 0)
+  )
+
+hel_df <- hel_df %>%
+  mutate(
+    Abundance_log = log10(Abundance + 1e-6),
+    diet = factor(diet, levels = c("CD", "HFD")),
+    sex  = factor(sex, levels = c("female", "male"))
+  )
+
+fit_relabund_hp_groups <- brm(
+  Abundance_log ~ diet * sex + log10_Hp,
+  data = hel_df,
+  family = gaussian(),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(student_t(3, 0, 1), class = "sigma")
+  ),
+  chains = 4, iter = 4000, warmup = 2000,
+  seed = 123
+)
+
+Hp_seq <- seq(
+  min(hel_df$log10_Hp, na.rm = TRUE),
+  max(hel_df$log10_Hp, na.rm = TRUE),
+  length.out = 100
+)
+
+newdata <- tidyr::expand_grid(
+  log10_Hp = Hp_seq,
+  diet = levels(hel_df$diet),
+  sex  = levels(hel_df$sex)
+) %>%
+  mutate(
+    diet = factor(diet, levels = levels(hel_df$diet)),
+    sex  = factor(sex, levels = levels(hel_df$sex))
+  )
+
+preds <- add_epred_draws(
+  fit_relabund_hp_groups,
+  newdata = newdata,
+  re_formula = NA
+)
+
+preds_sum <- preds %>%
+  group_by(diet, sex, log10_Hp) %>%
+  summarise(
+    median = median(.epred),
+    CI_low = quantile(.epred, 0.025),
+    CI_high = quantile(.epred, 0.975),
+    CI80_low = quantile(.epred, 0.10),
+    CI80_high = quantile(.epred, 0.90),
+    .groups = "drop"
+  )
+
+ggplot(preds_sum, aes(x = log10_Hp, y = median, color = diet, fill = diet)) +
+  geom_ribbon(aes(ymin = CI_low, ymax = CI_high), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~ sex) +
+  theme_bw() +
+  scale_color_manual(values = c("CD" = "#0072B2", "HFD" = "#D55E00")) +
+  scale_fill_manual(values = c("CD" = "#0072B2", "HFD" = "#D55E00")) +
+  labs(
+    x = "H. pylori load (log10)",
+    y = "Helicobacteraceae abundance (log10)",
+    color = "Diet",
+    fill = "Diet"
+  )
+```
+
+
+```{r}
+# ---------- ST colon genus-level selected families ----------
+target_families_genus_ST <- c(
+  "Prevotellaceae",
+  "Lachnospiraceae",
+  "Marinifilaceae",
+  "Streptococcaceae"
+)
+
+physeq_ST_comp_git_genus <- physeq_ST_comp %>%
+  subset_samples(timepoint == "t4") %>%
+  rename_eub_family(rank = "Genus")
+
+ps_colon_genus <- subset_samples(physeq_ST_comp_git_genus, sample_type == "colon")
+ps_colon_genus_clr <- clr_phyloseq(ps_colon_genus, tax_level = "Genus")
+df_colon_genus <- ps_clr_to_long(ps_colon_genus_clr, tax_level = "Genus")
+
+df_colon_genus_target <- df_colon_genus %>%
+  filter(
+    Family %in% target_families_genus_ST,
+    !is.na(Genus),
+    Genus != "",
+    Genus != "Unclassified"
+  )
+
+model_colon_genus_target <- run_microbiome_model(
+  df_colon_genus_target,
+  tax_level = "Genus"
+)
+
+grid_colon_genus <- tidyr::expand_grid(
+  Genus = levels(factor(df_colon_genus_target$Genus)),
+  sex = levels(df_colon_genus_target$sex),
+  treatment = levels(df_colon_genus_target$treatment),
+  diet = levels(df_colon_genus_target$diet)
+)
+
+preds_colon_genus <- model_colon_genus_target %>%
+  add_epred_draws(
+    newdata = grid_colon_genus,
+    ndraws = 2000,
+    re_formula = NULL
+  )
+
+eff_simple_treat_genus <- preds_colon_genus %>%
+  group_by(.draw, Genus, sex, diet, treatment) %>%
+  summarise(mu = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = treatment, values_from = mu) %>%
+  mutate(effect = Hp - Ctrl) %>%
+  group_by(Genus, sex, diet) %>%
+  summarise(
+    median   = median(effect),
+    CI_low   = quantile(effect, 0.025),
+    CI_high  = quantile(effect, 0.975),
+    CI80_low = quantile(effect, 0.10),
+    CI80_high= quantile(effect, 0.90),
+    Pd       = pmax(mean(effect > 0), mean(effect < 0)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    label = paste0("Treatment in ", diet),
+    type = "Simple Effects"
+  )
+
+eff_simple_diet_genus <- preds_colon_genus %>%
+  group_by(.draw, Genus, sex, treatment, diet) %>%
+  summarise(mu = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = diet, values_from = mu) %>%
+  mutate(effect = HFD - CD) %>%
+  group_by(Genus, sex, treatment) %>%
+  summarise(
+    median   = median(effect),
+    CI_low   = quantile(effect, 0.025),
+    CI_high  = quantile(effect, 0.975),
+    CI80_low = quantile(effect, 0.10),
+    CI80_high= quantile(effect, 0.90),
+    Pd       = pmax(mean(effect > 0), mean(effect < 0)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    label = paste0("Diet in ", treatment),
+    type = "Simple Effects"
+  )
+
+genus_family_key <- df_colon_genus_target %>%
+  distinct(Genus, Family)
+
+plot_df_genus <- bind_rows(eff_simple_treat_genus, eff_simple_diet_genus) %>%
+  left_join(genus_family_key, by = "Genus") %>%
+  mutate(
+    is_sig80 = (CI80_low > 0 & CI80_high > 0) | (CI80_low < 0 & CI80_high < 0),
+    color_group = case_when(
+      is_sig80 & sex == "female"  ~ "female_sig",
+      is_sig80 & sex == "male"    ~ "male_sig",
+      !is_sig80 & sex == "female" ~ "female_nonsig",
+      !is_sig80 & sex == "male"   ~ "male_nonsig"
+    )
+  )
+
+p_colon_genus <- ggplot(plot_df_genus, aes(x = label, y = median, color = color_group)) +
+  geom_linerange(
+    aes(ymin = CI_low, ymax = CI_high),
+    position = position_dodge(width = 0.6),
+    linewidth = 0.5
+  ) +
+  geom_linerange(
+    aes(ymin = CI80_low, ymax = CI80_high),
+    position = position_dodge(width = 0.6),
+    linewidth = 1.8
+  ) +
+  geom_point(
+    position = position_dodge(width = 0.6),
+    size = 1.8
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  facet_grid(rows = vars(Family, Genus), scales = "free_y", space = "free_y") +
+  scale_color_manual(values = sex_sig_cols) +
+  theme_bw(base_size = 11) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.text.y = element_text(color = "black", size = 8),
+    strip.text.y = element_text(face = "bold"),
+    legend.position = "bottom"
+  ) +
+  labs(
+    x = "",
+    y = "Effect estimate (CLR difference)",
+    color = "Sex / Evidence",
+    title = "Colon: genus-level effects within selected families"
+  )
+
+p_colon_genus
+
+```
+
+```{r}
+# ---------- ST colon family abundance figure ----------
+physeq_ST_comp_git_fam_df <- make_rel_abund_df(physeq_ST_comp_git, tax_level = "Family", pseudocount = TRUE)
+
+target_families_colon_ST <- c(
+  "Prevotellaceae",
+  "Lachnospiraceae",
+  "Marinifilaceae",
+  "Streptococcaceae",
+  "Akkermansiaceae",
+  "Eub. coprostanoligenes gr."
+)
+
+ps_colon_ST <- physeq_ST_comp_git %>%
+  subset_samples(sample_type == "colon")
+
+df_target_colon_ST <- ps_colon_ST %>%
+  transform_sample_counts(function(x) x / sum(x)) %>%
+  tax_glom(taxrank = "Family") %>%
+  psmelt() %>%
+  mutate(
+    Family = ifelse(is.na(Family) | Family == "", "Unclassified", as.character(Family))
+  ) %>%
+  filter(Family %in% target_families_colon_ST)
+
+colon_family_plots_ST <- make_target_family_plot_list(
+  df_target = df_target_colon_ST,
+  family_order = c(
+    "Akkermansiaceae",
+    "Lachnospiraceae",
+    "Marinifilaceae",
+    "Prevotellaceae",
+    "Streptococcaceae",
+    "Eub. coprostanoligenes gr."
+  )
+)
+
+colon_family_plot <- assemble_family_patchwork(colon_family_plots_ST, ncol = 3, nrow = 2)
+colon_family_plot
+
+ggsave("colon_family_plot.jpeg", plot = colon_family_plot, width = 9, height = 6, units = "in")
+
+physeq_ST_comp_colon <- subset_samples(physeq_ST_comp_git, sample_type == "colon")
+
+physeq_ST_comp_colon_top10_families <- top_taxa(
+  physeq_ST_comp_colon,
+  tax_level = "Family",
+  n_taxa = 10,
+  by_proportion = FALSE
+)
+
+physeq_ST_comp_git_fam_colon_df <- physeq_ST_comp_git_fam_df %>%
+  dplyr::filter(sample_type == "colon")
+
+physeq_ST_comp_git_fam_colon_df %>%
+  filter(Family == "Helicobacteraceae", Abundance > 0) %>%
+  group_by(mouseID, treatment) %>%
+  summarize(mean_abundance = mean(Abundance), .groups = "drop") %>%
+  mutate(percentage = mean_abundance * 100)
+
+plot_physeq_ST_comp_colon_top10_families <- make_top10_nested_bar(
+  ps_obj = physeq_ST_comp_colon_top10_families$ps_obj,
+  facet_formula = ~ treatment + sex + diet
+)
+
+plot_physeq_ST_comp_colon_top10_families
+
+plot_A_labeled <- cowplot::ggdraw(plot_physeq_ST_comp_colon_top10_families) +
+  cowplot::draw_label("A", x = 0.01, y = 0.99, hjust = 0, vjust = 1,
+                      fontface = "bold", size = 14)
+
+plot_B_labeled <- cowplot::ggdraw(colon_family_plot) +
+  cowplot::draw_label("B", x = 0.01, y = 0.99, hjust = 0, vjust = 1,
+                      fontface = "bold", size = 14)
+
+combined_colon_plot <- cowplot::plot_grid(
+  plot_A_labeled,
+  plot_B_labeled,
+  ncol = 1,
+  align = "v",
+  axis = "lr",
+  rel_heights = c(0.9, 1.2)
+)
+
+combined_colon_plot
+
+ggsave(
+  "combined_colon_plot_ST.jpeg",
+  plot = combined_colon_plot,
+  width = 9,
+  height = 10,
+  units = "in",
+  dpi = 300
+)
+
+# ---------- ST stomach family abundance figure ----------
+physeq_ST_comp_stomach <- physeq_ST_comp_git %>%
+  subset_samples(sample_type == "stomach")
+
+physeq_ST_comp_git_fam_stomach_df <- physeq_ST_comp_git_fam_df %>%
+  filter(sample_type == "stomach")
+
+physeq_ST_comp_stomach %>%
+  psmelt() %>%
+  filter(treatment != "Hp", Family == "Helicobacteraceae", Abundance > 0) %>%
+  group_by(seqSampleID, treatment) %>%
+  summarize(mean_abundance = mean(Abundance), .groups = "drop") %>%
+  mutate(percentage = mean_abundance * 100)
+
+physeq_ST_comp_stomach_top10_families <- top_taxa(
+  physeq_ST_comp_stomach,
+  tax_level = "Family",
+  n_taxa = 10,
+  by_proportion = FALSE
+)
+
+plot_physeq_ST_comp_stomach_top10_families <- make_top10_nested_bar(
+  ps_obj = physeq_ST_comp_stomach_top10_families$ps_obj,
+  facet_formula = ~ treatment + sex + diet
+)
+
+plot_physeq_ST_comp_stomach_top10_families
+
+target_families_stomach_ST <- c(
+  "Helicobacteraceae",
+  "Lactobacillaceae",
+  "Oscillospiraceae",
+  "Akkermansiaceae",
+  "Peptostreptococcaceae",
+  "Prevotellaceae",
+  "Ruminococcaceae"
+)
+
+df_target_stomach_ST <- physeq_ST_comp_stomach %>%
+  transform_sample_counts(function(x) x / sum(x)) %>%
+  tax_glom(taxrank = "Family") %>%
+  psmelt() %>%
+  mutate(
+    Family = ifelse(is.na(Family) | Family == "", "Unclassified", as.character(Family))
+  ) %>%
+  filter(Family %in% target_families_stomach_ST)
+
+stomach_family_plots_ST <- make_target_family_plot_list(
+  df_target = df_target_stomach_ST,
+  family_order = c(
+    "Helicobacteraceae",
+    "Lactobacillaceae",
+    "Oscillospiraceae",
+    "Akkermansiaceae",
+    "Peptostreptococcaceae",
+    "Prevotellaceae",
+    "Ruminococcaceae"
+  )
+)
+
+stomach_family_plot <- assemble_family_patchwork(stomach_family_plots_ST, ncol = 3, nrow = 3)
+stomach_family_plot
+
+ggsave("stomach_family_plot.jpeg", plot = stomach_family_plot, width = 9, height = 6, units = "in")
+
+plot_A_labeled_st <- cowplot::ggdraw(plot_physeq_ST_comp_stomach_top10_families) +
+  cowplot::draw_label("A", x = 0.01, y = 0.99, hjust = 0, vjust = 1,
+                      fontface = "bold", size = 14)
+
+plot_B_labeled_st <- cowplot::ggdraw(stomach_family_plot) +
+  cowplot::draw_label("B", x = 0.01, y = 0.99, hjust = 0, vjust = 1,
+                      fontface = "bold", size = 14)
+
+combined_stomach_plot <- cowplot::plot_grid(
+  plot_A_labeled_st,
+  plot_B_labeled_st,
+  ncol = 1,
+  align = "v",
+  axis = "lr",
+  rel_heights = c(0.9, 1.7)
+)
+
+combined_stomach_plot
+
+ggsave(
+  "combined_stomach_plot_ST.jpeg",
+  plot = combined_stomach_plot,
+  width = 9,
+  height = 14,
+  units = "in",
+  dpi = 300
+)
+
+```
+
+
+
+```{r}
+
+# ============================================================
+# LONG-TERM EXPERIMENT
+# ============================================================
+
+# ---------- LT fecal composition over time ----------
+physeq_LT_comp_fecal <- physeq_LT_comp %>%
+  subset_samples(timepoint != "t10") %>%
+  rename_eub_family(rank = "Family")
+
+physeq_LT_comp_fecal %>%
+  psmelt() %>%
+  filter(Family == "Helicobacteraceae", Abundance > 0) %>%
+  group_by(seqSampleID, treatment) %>%
+  summarise(total_abundance = sum(Abundance), .groups = "drop") %>%
+  mutate(percentage = total_abundance * 100)
+
+physeq_LT_comp_fecal_top10_families <- top_taxa(
+  physeq_LT_comp_fecal,
+  tax_level = "Family",
+  n_taxa = 10,
+  by_proportion = FALSE
+)
+
+physeq_LT_comp_fecal_top10_families_females <- subset_samples(
+  physeq_LT_comp_fecal_top10_families$ps_obj,
+  sex == "female"
+)
+
+physeq_LT_comp_fecal_top10_families_males <- subset_samples(
+  physeq_LT_comp_fecal_top10_families$ps_obj,
+  sex == "male"
+)
+
+make_LT_fecal_top10_plot <- function(ps_obj, sex_label) {
+  plot_nested_bar(
+    ps_obj = ps_obj,
+    top_level = "Phylum",
+    nested_level = "Family",
+    palette = c(
+      Bacillota = "#00F034",
+      Bacteroidota = "#008CF0",
+      Desulfobacterota = "#ECF000",
+      Verrucomicrobiota = "#CA0BE8"
+    )
+  ) +
+    labs(x = "Mouse ID", y = "Relative abundance") +
+    scale_y_continuous(sec.axis = sec_axis(~ ., name = sex_label)) +
+    facet_nested(
+      ~ treatment + weeks_on_diet,
+      nest_line = element_line(linetype = 1),
+      scales = "free_x",
+      space = "free",
+      labeller = labeller(
+        treatment = c("Ctrl" = "Control", "Hp" = "italic('H. pylori')"),
+        weeks_on_diet = c(
+          "-1" = "'-1w'", "0" = "'0w'", "1" = "'1w'",
+          "3" = "'3w'", "5" = "'5w'", "11" = "'11w'", "16" = "'16w'"
+        ),
+        .default = label_parsed
+      )
+    ) +
+    theme(
+      text = element_text(size = 16),
+      axis.text.x = element_blank(),
+      axis.text.y.right = element_blank(),
+      axis.ticks.y.right = element_blank(),
+      axis.ticks.x = element_blank(),
+      strip.background.x = element_rect(fill = "white"),
+      strip.text.x = element_text(color = "black", size = 16),
+      legend.position = "none",
+      legend.title = element_blank(),
+      panel.spacing = unit(0.75, "lines"),
+      panel.border = element_rect(color = "white", fill = NA, size = 0.5)
+    )
+}
+
+plot_physeq_LT_comp_fecal_top10_families_females <- make_LT_fecal_top10_plot(
+  physeq_LT_comp_fecal_top10_families_females,
+  "females"
+)
+
+plot_physeq_LT_comp_fecal_top10_families_males <- make_LT_fecal_top10_plot(
+  physeq_LT_comp_fecal_top10_families_males,
+  "males"
+)
+
+plot_physeq_LT_comp_fecal_top10_families <- ggpubr::ggarrange(
+  plot_physeq_LT_comp_fecal_top10_families_females,
+  plot_physeq_LT_comp_fecal_top10_families_males,
+  nrow = 2,
+  labels = c("A", ""),
+  align = "h",
+  common.legend = TRUE,
+  legend = "right"
+)
+
+plot_physeq_LT_comp_fecal_top10_families
+
+# ---------- LT GIT phyloseq object ----------
+physeq_LT_comp_git <- physeq_LT_comp %>%
+  subset_samples(timepoint == "t10") %>%
+  rename_eub_family(rank = "Family")
+
+physeq_LT_comp_git_fam_df <- make_rel_abund_df(
+  physeq_LT_comp_git,
+  tax_level = "Family",
+  pseudocount = TRUE
+)
+
+# ---------- LT fecal CLR post-diet ----------
+lt_fecal_post_obj <- make_family_clr_df(
+  physeq_obj = physeq_LT_comp,
+  sample_filter = weeks_on_diet > 0 & weeks_on_diet < 20,
+  prevalence_threshold = 0.10,
+  max_abundance_threshold = 0.001
+)
+
+clr_LT_fam_df_post <- lt_fecal_post_obj$clr_df
+
+lt_post_fit <- fit_family_models(
+  clr_df = clr_LT_fam_df_post,
+  time_levels = c("t3", "t4", "t5", "t8", "t9"),
+  priors = priors
+)
+
+plot_data_family_treatment_lines_LT <- extract_family_treatment_contrasts(
+  fit_models = lt_post_fit$fit_models,
+  time_levels = c("t3", "t4", "t5", "t8", "t9")
+) %>%
+  group_by(Family) %>%
+  filter(any(is_sig80 | is_sig95)) %>%
+  ungroup()
+
+p_family_treatment_effect_lines_LT <- plot_family_treatment_effects(
+  plot_data = plot_data_family_treatment_lines_LT,
+  time_levels = c("t3", "t4", "t5", "t8", "t9"),
+  ylab = "Hp − Ctrl effect (CLR)"
+)
+
+p_family_treatment_effect_lines_LT
+
+plot_A_labeled_LTfecal <- cowplot::ggdraw(plot_physeq_LT_comp_fecal_top10_families)
+
+plot_B_labeled_LTfecal <- cowplot::ggdraw(p_family_treatment_effect_lines_LT) +
+  cowplot::draw_label(
+    "B", x = 0.01, y = 0.99,
+    hjust = 0, vjust = 1,
+    fontface = "bold", size = 14
+  )
+
+combined_LTfecal_plot <- cowplot::plot_grid(
+  plot_A_labeled_LTfecal,
+  plot_B_labeled_LTfecal,
+  ncol = 1,
+  align = "v",
+  axis = "lr",
+  rel_heights = c(1.4, 1.3)
+)
+
+combined_LTfecal_plot
+
+ggsave(
+  "combined_LTfecal_plot.jpeg",
+  plot = combined_LTfecal_plot,
+  width = 12,
+  height = 16,
+  units = "in",
+  dpi = 300
+)
+
+# ---------- LT site CLR models ----------
+models_site_LT <- list()
+dfs_site_LT <- list()
+ps_clr_site_LT <- list()
+
+for (site_name in c("stomach", "ileum", "colon", "cecum")) {
+  cat("Running site:", site_name, "\n")
+
+  ps_site_LT <- subset_samples(physeq_LT_comp_git, sample_site == site_name)
+
+  if (length(sample_names(ps_site_LT)) == 0) next
+
+  ps_clr_LT <- clr_phyloseq(ps_site_LT, tax_level = "Family")
+  df_site_LT <- ps_clr_to_long(ps_clr_LT, tax_level = "Family")
+
+  if (nrow(df_site_LT) == 0) next
+
+  model_LT <- run_microbiome_model_no_diet(df_site_LT, tax_level = "Family")
+
+  ps_clr_site_LT[[site_name]] <- ps_clr_LT
+  dfs_site_LT[[site_name]] <- df_site_LT
+  models_site_LT[[site_name]] <- model_LT
+}
+
+site_plots_simple_LT <- list()
+site_simple_tables_LT <- list()
+
+for (site in names(models_site_LT)) {
+  df_site_LT <- dfs_site_LT[[site]]
+  model_site_LT <- models_site_LT[[site]]
+
+  grid_site_LT <- tidyr::expand_grid(
+    Family = levels(df_site_LT$Family),
+    sex = levels(df_site_LT$sex),
+    treatment = levels(df_site_LT$treatment)
+  )
+
+  preds_site_LT <- model_site_LT %>%
+    tidybayes::add_epred_draws(
+      newdata = grid_site_LT,
+      ndraws = 2000,
+      re_formula = NULL
+    )
+
+  eff_treat_by_sex_LT <- preds_site_LT %>%
+    group_by(.draw, Family, sex, treatment) %>%
+    summarise(mu = mean(.epred), .groups = "drop") %>%
+    tidyr::pivot_wider(names_from = treatment, values_from = mu) %>%
+    mutate(effect = Hp - Ctrl) %>%
+    group_by(Family, sex) %>%
+    summarise(
+      median = median(effect),
+      CI_low = quantile(effect, 0.025),
+      CI_high = quantile(effect, 0.975),
+      CI80_low = quantile(effect, 0.10),
+      CI80_high = quantile(effect, 0.90),
+      Pd = pmax(mean(effect > 0), mean(effect < 0)),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      label = "Treatment effect",
+      type = "Hp - Ctrl within sex"
+    ) %>%
+    mutate(
+      site = site,
+      is_sig80 = (CI80_low > 0 & CI80_high > 0) | (CI80_low < 0 & CI80_high < 0),
+      color_group = case_when(
+        is_sig80 & sex == "female"  ~ "female_sig",
+        is_sig80 & sex == "male"    ~ "male_sig",
+        !is_sig80 & sex == "female" ~ "female_nonsig",
+        !is_sig80 & sex == "male"   ~ "male_nonsig"
+      )
+    )
+
+  fam_order_LT <- eff_treat_by_sex_LT %>%
+    group_by(Family) %>%
+    summarise(max_abs = max(abs(median)), .groups = "drop") %>%
+    arrange(desc(max_abs)) %>%
+    slice_head(n = 10) %>%
+    pull(Family)
+
+  plot_df_simple_LT <- eff_treat_by_sex_LT %>%
+    filter(Family %in% fam_order_LT) %>%
+    mutate(
+      Family = factor(Family, levels = fam_order_LT),
+      sex = factor(sex, levels = c("female", "male"))
+    )
+
+  p_simple_LT <- ggplot(plot_df_simple_LT, aes(x = sex, y = median, color = color_group)) +
+    geom_linerange(
+      aes(ymin = CI_low, ymax = CI_high),
+      position = position_dodge(width = 0.4),
+      linewidth = 0.5
+    ) +
+    geom_linerange(
+      aes(ymin = CI80_low, ymax = CI80_high),
+      position = position_dodge(width = 0.4),
+      linewidth = 1.8
+    ) +
+    geom_point(
+      position = position_dodge(width = 0.4),
+      size = 1.8
+    ) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    coord_flip() +
+    facet_grid(rows = vars(Family)) +
+    scale_color_manual(values = sex_sig_cols) +
+    theme_bw(base_size = 11) +
+    theme(
+      panel.grid.major.y = element_blank(),
+      axis.text.y = element_text(color = "black", size = 8),
+      strip.text.y = element_text(face = "bold"),
+      legend.position = "bottom"
+    ) +
+    labs(
+      x = "",
+      y = "Treatment effect (Hp - Ctrl, CLR difference)",
+      color = "Sex / Evidence",
+      title = site
+    )
+
+  site_simple_tables_LT[[site]] <- plot_df_simple_LT
+  site_plots_simple_LT[[site]] <- p_simple_LT
+}
+
+site_plots_simple_LT$stomach
+site_plots_simple_LT$ileum
+site_plots_simple_LT$colon
+site_plots_simple_LT$cecum
+
+# ---------- LT selected-family abundance plots ----------
+target_families_colon_LT <- c(
+  "Prevotellaceae",
+  "Lachnospiraceae",
+  "Marinifilaceae",
+  "Lactobacilliaceae",
+  "Akkermansiaceae",
+  "Eub. coprostanoligenes gr.",
+  "Tannerellaceae",
+  "Desulfovibrionaceae",
+  "Bacteroidaceae",
+  "Oscillospiraceae"
+)
+
+target_families_stomach_LT <- c(
+  "Helicobacteraceae",
+  "Tannerellaceae",
+  "Akkermansiaceae",
+  "Marinifilaceae",
+  "Prevotellaceae",
+  "Lactobacilliaceae"
+)
+
+target_families_cecum_LT <- c(
+  "Akkermansiaceae",
+  "Lactobacilliaceae",
+  "Ruminococcaceae",
+  "Streptococcaceae",
+  "Desulfovibrionaceae",
+  "Tannerellaceae",
+  "Erysipelotrichaceae",
+  "Eub. coprostanoligenes gr.",
+  "Prevotellaceae"
+)
+
+make_LT_target_df <- function(ps, target_families) {
+  ps %>%
+    transform_sample_counts(function(x) x / sum(x)) %>%
+    tax_glom(taxrank = "Family") %>%
+    psmelt() %>%
+    mutate(
+      Family = ifelse(is.na(Family) | Family == "", "Unclassified", as.character(Family))
+    ) %>%
+    filter(Family %in% target_families)
+}
+
+df_target_colon_LT <- make_LT_target_df(
+  subset_samples(physeq_LT_comp_git, sample_site == "colon"),
+  target_families_colon_LT
+)
+
+colon_family_plot_LT <- assemble_family_patchwork(
+  make_target_family_plot_list(
+    df_target_colon_LT,
+    c(
+      "Akkermansiaceae",
+      "Lactobacilliaceae",
+      "Prevotellaceae",
+      "Lachnospiraceae",
+      "Marinifilaceae",
+      "Tannerellaceae",
+      "Desulfovibrionaceae",
+      "Bacteroidaceae",
+      "Oscillospiraceae",
+      "Eub. coprostanoligenes gr."
+    )
+  ),
+  ncol = 3
+)
+
+colon_family_plot_LT
+
+ggsave(
+  "colon_family_plot_LT.jpeg",
+  plot = colon_family_plot_LT,
+  width = 8.5,
+  height = 6,
+  units = "in"
+)
+
+df_target_stomach_LT <- make_LT_target_df(
+  subset_samples(physeq_LT_comp_git, sample_site == "stomach"),
+  target_families_stomach_LT
+)
+
+stomach_family_plot_LT <- assemble_family_patchwork(
+  make_target_family_plot_list(
+    df_target_stomach_LT,
+    c(
+      "Helicobacteraceae",
+      "Tannerellaceae",
+      "Akkermansiaceae",
+      "Marinifilaceae",
+      "Prevotellaceae",
+      "Lactobacilliaceae"
+    )
+  ),
+  ncol = 3
+)
+
+stomach_family_plot_LT
+
+ggsave(
+  "stomach_family_plot_LT.jpeg",
+  plot = stomach_family_plot_LT,
+  width = 8.5,
+  height = 4,
+  units = "in"
+)
+
+df_target_cecum_LT <- make_LT_target_df(
+  subset_samples(physeq_LT_comp_git, sample_site == "cecum"),
+  target_families_cecum_LT
+)
+
+cecum_family_plot_LT <- assemble_family_patchwork(
+  make_target_family_plot_list(
+    df_target_cecum_LT,
+    c(
+      "Akkermansiaceae",
+      "Lactobacilliaceae",
+      "Ruminococcaceae",
+      "Streptococcaceae",
+      "Desulfovibrionaceae",
+      "Tannerellaceae",
+      "Erysipelotrichaceae",
+      "Eub. coprostanoligenes gr.",
+      "Prevotellaceae"
+    )
+  ),
+  ncol = 3
+)
+
+cecum_family_plot_LT
+
+ggsave(
+  "cecum_family_plot_LT.jpeg",
+  plot = cecum_family_plot_LT,
+  width = 8.5,
+  height = 6,
+  units = "in"
+)
+
+
+```
+
+```{r}
+
+# ---------- LT top10 GIT site plots ----------
+physeq_LT_comp_stomach <- subset_samples(physeq_LT_comp_git, sample_site == "stomach")
+physeq_LT_comp_cecum   <- subset_samples(physeq_LT_comp_git, sample_site == "cecum")
+physeq_LT_comp_colon   <- subset_samples(physeq_LT_comp_git, sample_site == "colon")
+
+plot_physeq_LT_comp_stomach_top10_families <- make_top10_nested_bar(
+  top_taxa(physeq_LT_comp_stomach, tax_level = "Family", n_taxa = 10, by_proportion = FALSE)$ps_obj,
+  ~ treatment + sex
+)
+
+plot_physeq_LT_comp_cecum_top10_families <- make_top10_nested_bar(
+  top_taxa(physeq_LT_comp_cecum, tax_level = "Family", n_taxa = 10, by_proportion = FALSE)$ps_obj,
+  ~ treatment + sex
+)
+
+plot_physeq_LT_comp_colon_top10_families <- make_top10_nested_bar(
+  top_taxa(physeq_LT_comp_colon, tax_level = "Family", n_taxa = 10, by_proportion = FALSE)$ps_obj,
+  ~ treatment + sex
+)
+
+plot_A_labeled_LT_colon <- cowplot::ggdraw(plot_physeq_LT_comp_colon_top10_families) +
+  cowplot::draw_label("A", x = 0.01, y = 0.99, hjust = 0, vjust = 1,
+                      fontface = "bold", size = 14)
+
+plot_B_labeled_LT_colon <- cowplot::ggdraw(colon_family_plot_LT) +
+  cowplot::draw_label("B", x = 0.01, y = 0.99, hjust = 0, vjust = 1,
+                      fontface = "bold", size = 14)
+
+combined_LT_colon_plot <- cowplot::plot_grid(
+  plot_A_labeled_LT_colon,
+  plot_B_labeled_LT_colon,
+  ncol = 1,
+  align = "v",
+  axis = "lr",
+  rel_heights = c(0.7, 1.3)
+)
+
+combined_LT_colon_plot
+
+ggsave(
+  "combined_LT_colon_plot.jpeg",
+  plot = combined_LT_colon_plot,
+  width = 9,
+  height = 11,
+  units = "in",
+  dpi = 300
+)
+
+plot_A_labeled_LT_stomach <- cowplot::ggdraw(plot_physeq_LT_comp_stomach_top10_families) +
+  cowplot::draw_label("A", x = 0.01, y = 0.99, hjust = 0, vjust = 1,
+                      fontface = "bold", size = 14)
+
+plot_B_labeled_LT_stomach <- cowplot::ggdraw(stomach_family_plot_LT) +
+  cowplot::draw_label("B", x = 0.01, y = 0.99, hjust = 0, vjust = 1,
+                      fontface = "bold", size = 14)
+
+combined_LT_stomach_plot <- cowplot::plot_grid(
+  plot_A_labeled_LT_stomach,
+  plot_B_labeled_LT_stomach,
+  ncol = 1,
+  align = "v",
+  axis = "lr",
+  rel_heights = c(0.7, 0.9)
+)
+
+combined_LT_stomach_plot
+
+ggsave(
+  "combined_LT_stomach_plot.jpeg",
+  plot = combined_LT_stomach_plot,
+  width = 9,
+  height = 9,
+  units = "in",
+  dpi = 300
+)
+
+plot_A_labeled_LT_cecum <- cowplot::ggdraw(plot_physeq_LT_comp_cecum_top10_families) +
+  cowplot::draw_label("A", x = 0.01, y = 0.99, hjust = 0, vjust = 1,
+                      fontface = "bold", size = 14)
+
+plot_B_labeled_LT_cecum <- cowplot::ggdraw(cecum_family_plot_LT) +
+  cowplot::draw_label("B", x = 0.01, y = 0.99, hjust = 0, vjust = 1,
+                      fontface = "bold", size = 14)
+
+combined_LT_cecum_plot <- cowplot::plot_grid(
+  plot_A_labeled_LT_cecum,
+  plot_B_labeled_LT_cecum,
+  ncol = 1,
+  align = "v",
+  axis = "lr",
+  rel_heights = c(0.7, 1.3)
+)
+
+combined_LT_cecum_plot
+
+ggsave(
+  "combined_LT_cecum_plot.jpeg",
+  plot = combined_LT_cecum_plot,
+  width = 9,
+  height = 11,
+  units = "in",
+  dpi = 300
+)
+
+
+```
+
+```{r}
+# ---------- LT Helicobacteraceae abundance vs Hp load ----------
+phy_stomach_hp_LT <- physeq_LT_comp_git %>%
+  subset_samples(sample_site == "stomach" & treatment == "Hp") %>%
+  transform_sample_counts(function(x) x / sum(x))
+
+phy_family_LT <- tax_glom(phy_stomach_hp_LT, taxrank = "Family")
+
+hel_df_LT <- psmelt(phy_family_LT) %>%
+  filter(Family == "Helicobacteraceae") %>%
+  select(Sample, Abundance) %>%
+  mutate(sample_ID_clean = clean_sample_id(Sample))
+
+meta_df_LT <- data.frame(sample_data(phy_stomach_hp_LT)) %>%
+  tibble::rownames_to_column("Sample") %>%
+  mutate(sample_ID_clean = clean_sample_id(Sample))
+
+hel_df_LT <- hel_df_LT %>%
+  inner_join(meta_df_LT, by = "sample_ID_clean") %>%
+  inner_join(MS1_Hp_loads_LT, by = "mouseID") %>%
+  mutate(log10_Hp = log10(Hp_copies_std.x))
+
+fit_relabund_hp_LT <- brm(
+  Abundance ~ log10_Hp,
+  data = hel_df_LT,
+  family = gaussian(),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(student_t(3, 0, 1), class = "sigma")
+  ),
+  chains = 4, iter = 4000, warmup = 2000,
+  seed = 123
+)
+
+posterior_LT <- as_draws_df(fit_relabund_hp_LT)
+
+posterior_LT %>%
+  summarise(
+    median = median(b_log10_Hp),
+    CI_low = quantile(b_log10_Hp, 0.025),
+    CI_high = quantile(b_log10_Hp, 0.975),
+    prob_pos = mean(b_log10_Hp > 0)
+  )
+```
