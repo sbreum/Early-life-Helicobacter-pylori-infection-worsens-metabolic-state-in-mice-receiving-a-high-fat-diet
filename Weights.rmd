@@ -1,4 +1,5 @@
 
+
 ---
 title: "Weight"
 author: "Sigri"
@@ -35,7 +36,7 @@ weights <- read_xlsx("MS1_weights.xlsx") %>%
 
 ```{r add Hp loads}
 # Load Hp loads data
-MS1_Hp_loads <- read_xlsx("/MS1_Hp_loads.xlsx") %>%
+MS1_Hp_loads <- read_xlsx("MS1_Hp_loads.xlsx") %>%
   select(mouseID, Hp_copies_std) 
 
 # Add Hp loads to dataframe
@@ -217,7 +218,7 @@ ST_weights_plot <- ggplot(plot_df_final, aes(x = label, y = median, color = sex)
   geom_point(
     aes(shape = type),
     position = position_dodge(width = 0.6),
-    size = 2
+    size = 3
   ) +
 
   geom_hline(yintercept = 0, linetype = "dashed") +
@@ -470,7 +471,7 @@ LT_weights_forestplot <- ggplot(
   # median
   geom_point(
     position = position_dodge(width = 0.5),
-    size = 2
+    size = 3
   ) +
 
   geom_hline(yintercept = 0, linetype = "dashed") +
@@ -612,17 +613,17 @@ C <- ST_weights_plot + theme(legend.position = "none")
 D <- LT_weights_forestplot + theme(legend.position = "none")
 
 # Reduce heights of each plot relative to width
-AB <- plot_grid(A, B, ncol = 2, labels = c("A", "B"), rel_widths = c(1, 1), align = "v")
-AB_with_legend <- plot_grid(AB, legend_AB, ncol = 1, rel_heights = c(1, 0.12)) 
+AB <- cowplot::plot_grid(A, B, ncol = 2, labels = c("A", "B"), rel_widths = c(1, 1), align = "v")
+AB_with_legend <- cowplot::plot_grid(AB, legend_AB, ncol = 1, rel_heights = c(1, 0.12)) 
 
-CD <- plot_grid(C, D, ncol = 2, labels = c("C", "D"), rel_widths = c(1, 1), align = "v")
-CD_with_legend <- plot_grid(CD, legend_CD, ncol = 2, rel_widths = c(1, 0.15)) 
+CD <- cowplot::plot_grid(C, D, ncol = 2, labels = c("C", "D"), rel_widths = c(1, 1), align = "v")
+CD_with_legend <- cowplot::plot_grid(CD, legend_CD, ncol = 2, rel_widths = c(1, 0.15)) 
 
 # Add a small spacer between AB and CD
-spacer <- plot_grid(NULL, NULL, ncol = 1, rel_heights = c(0.05))
+spacer <- cowplot::plot_grid(NULL, NULL, ncol = 1, rel_heights = c(0.05))
 
 # Combine top (AB) and bottom (CD) panels
-MS1_bodyweight_final <- plot_grid(
+MS1_bodyweight_final <- cowplot::plot_grid(
   AB_with_legend, spacer, CD_with_legend,
   ncol = 1,
   rel_heights = c(1, 0.05, 0.9), # leave space for top legend
@@ -634,8 +635,6 @@ ggsave("MS1_bodyweight_final.jpeg", MS1_bodyweight_final, width = 9.8, height = 
 
 MS1_bodyweight_final
 ```
-
-
 ```{r}
 #WAT weight LT experiment
 # --- 1. FILTER LT DATA ---
