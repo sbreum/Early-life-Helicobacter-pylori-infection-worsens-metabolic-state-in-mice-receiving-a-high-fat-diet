@@ -1,5 +1,5 @@
 ---
-title: "Untitled"
+title: "MSD"
 output: html_document
 date: "2025-12-02"
 ---
@@ -237,7 +237,54 @@ plot_b0_effects <- function(dat) {
 # ------------------------------------------------------------
 # 6. Plot all biomarkers
 # ------------------------------------------------------------
-p_b0_all <- plot_b0_effects(summary_probs_b0)
+# ------------------------------------------------------------
+# 6. Plot all biomarkers (with 80% + 95% CI)
+# ------------------------------------------------------------
+p_b0_all <- ggplot(summary_probs_b0, aes(x = biomarker, y = median, color = sex)) +
+  
+  # 95% CI (thin)
+  geom_linerange(
+    aes(ymin = CI_low, ymax = CI_high),
+    position = position_dodge(width = 0.5),
+    linewidth = 0.7,
+    alpha = 0.8
+  ) +
+  
+  # 80% CI (thick)
+  geom_linerange(
+    aes(ymin = CI80_low, ymax = CI80_high),
+    position = position_dodge(width = 0.5),
+    linewidth = 2
+  ) +
+  
+  # Larger points
+  geom_point(
+    position = position_dodge(width = 0.5),
+    size = 3
+  ) +
+  
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  
+  scale_color_manual(values = c(
+    "male"   = "#6a0dad",
+    "female" = "#b19cd9"
+  )) +
+  
+  coord_flip() +
+  
+  labs(
+    y = "Effect estimate (Hp - Ctrl, log10 scale)",
+    x = "Biomarker",
+    color = "Sex"
+  ) +
+  
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.y = element_text(size = 12, color = "black"),
+    panel.grid.major.y = element_blank()
+  )
+
 p_b0_all
 
 # ------------------------------------------------------------
@@ -358,13 +405,16 @@ eff_main_treat_cattime_avg <- preds_cattime_avgtime %>%
   mutate(effect = Hp - Ctrl) %>%
   group_by(biomarker, sex) %>%
   summarise(
-    median    = median(effect),
-    CI_low    = quantile(effect, 0.025),
-    CI_high   = quantile(effect, 0.975),
-    CI80_low  = quantile(effect, 0.10),
-    CI80_high = quantile(effect, 0.90),
-    .groups = "drop"
-  ) %>%
+  median    = median(effect),
+  CI_low    = quantile(effect, 0.025),
+  CI_high   = quantile(effect, 0.975),
+  CI80_low  = quantile(effect, 0.10),
+  CI80_high = quantile(effect, 0.90),
+  p_gt0     = mean(effect > 0),
+  p_lt0     = mean(effect < 0),
+  .groups = "drop"
+) %>%
+mutate(post_prob = pmax(p_gt0, p_lt0)) %>%
   mutate(type = "Main Effects", label = "Treatment")
 
 eff_main_diet_cattime_avg <- preds_cattime_avgtime %>%
@@ -373,14 +423,17 @@ eff_main_diet_cattime_avg <- preds_cattime_avgtime %>%
   pivot_wider(names_from = diet, values_from = epred_avgtime) %>%
   mutate(effect = HFD - CD) %>%
   group_by(biomarker, sex) %>%
-  summarise(
-    median    = median(effect),
-    CI_low    = quantile(effect, 0.025),
-    CI_high   = quantile(effect, 0.975),
-    CI80_low  = quantile(effect, 0.10),
-    CI80_high = quantile(effect, 0.90),
-    .groups = "drop"
-  ) %>%
+ summarise(
+  median    = median(effect),
+  CI_low    = quantile(effect, 0.025),
+  CI_high   = quantile(effect, 0.975),
+  CI80_low  = quantile(effect, 0.10),
+  CI80_high = quantile(effect, 0.90),
+  p_gt0     = mean(effect > 0),
+  p_lt0     = mean(effect < 0),
+  .groups = "drop"
+) %>%
+mutate(post_prob = pmax(p_gt0, p_lt0)) %>%
   mutate(type = "Main Effects", label = "Diet")
 
 
@@ -395,13 +448,16 @@ eff_interaction_cattime_avg <- preds_cattime_avgtime %>%
   ) %>%
   group_by(biomarker, sex) %>%
   summarise(
-    median    = median(effect),
-    CI_low    = quantile(effect, 0.025),
-    CI_high   = quantile(effect, 0.975),
-    CI80_low  = quantile(effect, 0.10),
-    CI80_high = quantile(effect, 0.90),
-    .groups = "drop"
-  ) %>%
+  median    = median(effect),
+  CI_low    = quantile(effect, 0.025),
+  CI_high   = quantile(effect, 0.975),
+  CI80_low  = quantile(effect, 0.10),
+  CI80_high = quantile(effect, 0.90),
+  p_gt0     = mean(effect > 0),
+  p_lt0     = mean(effect < 0),
+  .groups = "drop"
+) %>%
+mutate(post_prob = pmax(p_gt0, p_lt0)) %>%
   mutate(type = "Interaction", label = "Interaction")
 
 
@@ -412,13 +468,16 @@ eff_simple_treat_cattime_avg <- preds_cattime_avgtime %>%
   mutate(effect = Hp - Ctrl) %>%
   group_by(biomarker, sex, diet) %>%
   summarise(
-    median    = median(effect),
-    CI_low    = quantile(effect, 0.025),
-    CI_high   = quantile(effect, 0.975),
-    CI80_low  = quantile(effect, 0.10),
-    CI80_high = quantile(effect, 0.90),
-    .groups = "drop"
-  ) %>%
+  median    = median(effect),
+  CI_low    = quantile(effect, 0.025),
+  CI_high   = quantile(effect, 0.975),
+  CI80_low  = quantile(effect, 0.10),
+  CI80_high = quantile(effect, 0.90),
+  p_gt0     = mean(effect > 0),
+  p_lt0     = mean(effect < 0),
+  .groups = "drop"
+) %>%
+mutate(post_prob = pmax(p_gt0, p_lt0)) %>%
   mutate(
     type  = "Simple Effects",
     label = paste("Treatment in", diet)
@@ -432,13 +491,16 @@ eff_simple_diet_cattime_avg <- preds_cattime_avgtime %>%
   mutate(effect = HFD - CD) %>%
   group_by(biomarker, sex, treatment) %>%
   summarise(
-    median    = median(effect),
-    CI_low    = quantile(effect, 0.025),
-    CI_high   = quantile(effect, 0.975),
-    CI80_low  = quantile(effect, 0.10),
-    CI80_high = quantile(effect, 0.90),
-    .groups = "drop"
-  ) %>%
+  median    = median(effect),
+  CI_low    = quantile(effect, 0.025),
+  CI_high   = quantile(effect, 0.975),
+  CI80_low  = quantile(effect, 0.10),
+  CI80_high = quantile(effect, 0.90),
+  p_gt0     = mean(effect > 0),
+  p_lt0     = mean(effect < 0),
+  .groups = "drop"
+) %>%
+mutate(post_prob = pmax(p_gt0, p_lt0)) %>%
   mutate(
     type  = "Simple Effects",
     label = paste("Diet in", treatment)
@@ -487,13 +549,16 @@ make_day_effects_from_cattime_model <- function(preds_cattime_input, day_label) 
     mutate(effect = Hp - Ctrl) %>%
     group_by(biomarker, sex) %>%
     summarise(
-      median    = median(effect),
-      CI_low    = quantile(effect, 0.025),
-      CI_high   = quantile(effect, 0.975),
-      CI80_low  = quantile(effect, 0.10),
-      CI80_high = quantile(effect, 0.90),
-      .groups = "drop"
-    ) %>%
+  median    = median(effect),
+  CI_low    = quantile(effect, 0.025),
+  CI_high   = quantile(effect, 0.975),
+  CI80_low  = quantile(effect, 0.10),
+  CI80_high = quantile(effect, 0.90),
+  p_gt0     = mean(effect > 0),
+  p_lt0     = mean(effect < 0),
+  .groups = "drop"
+) %>%
+mutate(post_prob = pmax(p_gt0, p_lt0)) %>%
     mutate(type = "Main Effects", label = "Treatment")
   
   # B. Main Effect: Diet
@@ -504,13 +569,16 @@ make_day_effects_from_cattime_model <- function(preds_cattime_input, day_label) 
     mutate(effect = HFD - CD) %>%
     group_by(biomarker, sex) %>%
     summarise(
-      median    = median(effect),
-      CI_low    = quantile(effect, 0.025),
-      CI_high   = quantile(effect, 0.975),
-      CI80_low  = quantile(effect, 0.10),
-      CI80_high = quantile(effect, 0.90),
-      .groups = "drop"
-    ) %>%
+  median    = median(effect),
+  CI_low    = quantile(effect, 0.025),
+  CI_high   = quantile(effect, 0.975),
+  CI80_low  = quantile(effect, 0.10),
+  CI80_high = quantile(effect, 0.90),
+  p_gt0     = mean(effect > 0),
+  p_lt0     = mean(effect < 0),
+  .groups = "drop"
+) %>%
+mutate(post_prob = pmax(p_gt0, p_lt0)) %>%
     mutate(type = "Main Effects", label = "Diet")
   
   # C. Treatment × Diet interaction
@@ -524,14 +592,17 @@ make_day_effects_from_cattime_model <- function(preds_cattime_input, day_label) 
       effect   = diff_HFD - diff_CD
     ) %>%
     group_by(biomarker, sex) %>%
-    summarise(
-      median    = median(effect),
-      CI_low    = quantile(effect, 0.025),
-      CI_high   = quantile(effect, 0.975),
-      CI80_low  = quantile(effect, 0.10),
-      CI80_high = quantile(effect, 0.90),
-      .groups = "drop"
-    ) %>%
+   summarise(
+  median    = median(effect),
+  CI_low    = quantile(effect, 0.025),
+  CI_high   = quantile(effect, 0.975),
+  CI80_low  = quantile(effect, 0.10),
+  CI80_high = quantile(effect, 0.90),
+  p_gt0     = mean(effect > 0),
+  p_lt0     = mean(effect < 0),
+  .groups = "drop"
+) %>%
+mutate(post_prob = pmax(p_gt0, p_lt0)) %>%
     mutate(type = "Interaction", label = "Interaction")
   
   # D. Simple Effects: Treatment within Diet
@@ -542,13 +613,16 @@ make_day_effects_from_cattime_model <- function(preds_cattime_input, day_label) 
     mutate(effect = Hp - Ctrl) %>%
     group_by(biomarker, sex, diet) %>%
     summarise(
-      median    = median(effect),
-      CI_low    = quantile(effect, 0.025),
-      CI_high   = quantile(effect, 0.975),
-      CI80_low  = quantile(effect, 0.10),
-      CI80_high = quantile(effect, 0.90),
-      .groups = "drop"
-    ) %>%
+  median    = median(effect),
+  CI_low    = quantile(effect, 0.025),
+  CI_high   = quantile(effect, 0.975),
+  CI80_low  = quantile(effect, 0.10),
+  CI80_high = quantile(effect, 0.90),
+  p_gt0     = mean(effect > 0),
+  p_lt0     = mean(effect < 0),
+  .groups = "drop"
+) %>%
+mutate(post_prob = pmax(p_gt0, p_lt0)) %>%
     mutate(
       type  = "Simple Effects",
       label = paste("Treatment in", diet)
@@ -562,13 +636,16 @@ make_day_effects_from_cattime_model <- function(preds_cattime_input, day_label) 
     mutate(effect = HFD - CD) %>%
     group_by(biomarker, sex, treatment) %>%
     summarise(
-      median    = median(effect),
-      CI_low    = quantile(effect, 0.025),
-      CI_high   = quantile(effect, 0.975),
-      CI80_low  = quantile(effect, 0.10),
-      CI80_high = quantile(effect, 0.90),
-      .groups = "drop"
-    ) %>%
+  median    = median(effect),
+  CI_low    = quantile(effect, 0.025),
+  CI_high   = quantile(effect, 0.975),
+  CI80_low  = quantile(effect, 0.10),
+  CI80_high = quantile(effect, 0.90),
+  p_gt0     = mean(effect > 0),
+  p_lt0     = mean(effect < 0),
+  .groups = "drop"
+) %>%
+mutate(post_prob = pmax(p_gt0, p_lt0)) %>%
     mutate(
       type  = "Simple Effects",
       label = paste("Diet in", treatment)
@@ -926,7 +1003,6 @@ fit_wat_b4 <- brm(
   backend = "cmdstanr", seed = 123
 )
 
-
 # --- 2. PREDICTIONS ---
 newdata_b4_WAT <- expand_grid(
   sex       = unique(df_b4_WAT$sex),
@@ -936,6 +1012,20 @@ newdata_b4_WAT <- expand_grid(
 
 preds_b4_WAT <- add_epred_draws(newdata_b4_WAT, fit_wat_b4)
 
+# Helper for posterior summaries
+summarise_effect <- function(data, group_vars) {
+  data %>%
+    group_by(across(all_of(group_vars))) %>%
+    summarise(
+      median    = median(effect),
+      CI95_low  = quantile(effect, 0.025),
+      CI95_high = quantile(effect, 0.975),
+      CI80_low  = quantile(effect, 0.10),
+      CI80_high = quantile(effect, 0.90),
+      .groups = "drop"
+    )
+}
+
 # --- 3. CALCULATE EFFECTS AS PERCENTAGE CHANGE ---
 # Formula: ((Test / Reference) - 1) * 100
 
@@ -944,62 +1034,54 @@ eff_main_treat <- preds_b4_WAT %>%
   group_by(sex, treatment, .draw) %>%
   summarise(epred = mean(.epred), .groups = "drop") %>%
   pivot_wider(names_from = treatment, values_from = epred) %>%
-  # CHANGE: Calculate % Change
   mutate(effect = (Hp / Ctrl - 1) * 100) %>%
-  group_by(sex) %>%
-  summarise(median = median(effect), CI_low = quantile(effect, 0.025), CI_high = quantile(effect, 0.975), .groups="drop") %>%
+  summarise_effect(group_vars = "sex") %>%
   mutate(type = "Main Effects", label = "Treatment")
 
 eff_main_diet <- preds_b4_WAT %>%
   group_by(sex, diet, .draw) %>%
   summarise(epred = mean(.epred), .groups = "drop") %>%
   pivot_wider(names_from = diet, values_from = epred) %>%
-  #  Calculate % Change
   mutate(effect = (HFD / CD - 1) * 100) %>%
-  group_by(sex) %>%
-  summarise(median = median(effect), CI_low = quantile(effect, 0.025), CI_high = quantile(effect, 0.975), .groups="drop") %>%
+  summarise_effect(group_vars = "sex") %>%
   mutate(type = "Main Effects", label = "Diet")
 
-# C. Simple Effects
+# B. Simple Effects
 eff_simple_treat <- preds_b4_WAT %>%
   group_by(sex, diet, treatment, .draw) %>%
   summarise(epred = mean(.epred), .groups = "drop") %>%
   pivot_wider(names_from = treatment, values_from = epred) %>%
-  #  Calculate % Change
   mutate(effect = (Hp / Ctrl - 1) * 100) %>%
-  group_by(sex, diet) %>%
-  summarise(median = median(effect), CI_low = quantile(effect, 0.025), CI_high = quantile(effect, 0.975), .groups="drop") %>%
+  summarise_effect(group_vars = c("sex", "diet")) %>%
   mutate(type = "Simple Effects", label = paste("Treatment in", diet))
 
 eff_simple_diet <- preds_b4_WAT %>%
-  group_by(sex, diet, treatment, .draw) %>%
+  group_by(sex, treatment, diet, .draw) %>%
   summarise(epred = mean(.epred), .groups = "drop") %>%
   pivot_wider(names_from = diet, values_from = epred) %>%
-  # Calculate % Change
   mutate(effect = (HFD / CD - 1) * 100) %>%
-  group_by(sex, treatment) %>%
-  summarise(median = median(effect), CI_low = quantile(effect, 0.025), CI_high = quantile(effect, 0.975), .groups="drop") %>%
+  summarise_effect(group_vars = c("sex", "treatment")) %>%
   mutate(type = "Simple Effects", label = paste("Diet in", treatment))
 
-# B. Interaction (Difference of Percentages)
+# C. Interaction (Difference of Percentages)
 eff_interaction <- preds_b4_WAT %>%
   group_by(sex, diet, treatment, .draw) %>%
   summarise(epred = mean(.epred), .groups = "drop") %>%
   pivot_wider(names_from = c(treatment, diet), values_from = epred) %>%
   mutate(
-    # % Effect of Hp in HFD
     pct_HFD = (Hp_HFD / Ctrl_HFD - 1) * 100,
-    # % Effect of Hp in CD
     pct_CD  = (Hp_CD / Ctrl_CD - 1) * 100,
-    # Interaction = Difference in % points
     effect  = pct_HFD - pct_CD
   ) %>%
-  group_by(sex) %>%
-  summarise(median = median(effect), CI_low = quantile(effect, 0.025), CI_high = quantile(effect, 0.975), .groups="drop") %>%
+  summarise_effect(group_vars = "sex") %>%
   mutate(type = "Interaction", label = "Interaction")
 
 # --- 4. COMBINE AND ORDER ---
-plot_df_wat <- bind_rows(eff_main_treat, eff_main_diet, eff_interaction, eff_simple_treat, eff_simple_diet) %>%
+plot_df_wat <- bind_rows(
+  eff_main_treat, eff_main_diet,
+  eff_interaction,
+  eff_simple_treat, eff_simple_diet
+) %>%
   mutate(
     label = factor(label, levels = c(
       "Diet in Hp", "Diet in Ctrl", 
@@ -1011,61 +1093,70 @@ plot_df_wat <- bind_rows(eff_main_treat, eff_main_diet, eff_interaction, eff_sim
   )
 
 # --- 5. PLOT ---
+pd <- position_dodge(width = 0.6)
+
 WAT_plot <- ggplot(plot_df_wat, aes(x = label, y = median, color = sex)) +
-  
-  geom_pointrange(aes(ymin = CI_low, ymax = CI_high, shape = type), 
-                  position = position_dodge(width = 0.6), size = 0.8) +
-  
+
+  # 95% CI: thinner outer interval
+  geom_linerange(
+    aes(ymin = CI95_low, ymax = CI95_high),
+    position = pd,
+    linewidth = 0.7,
+    alpha = 0.8
+  ) +
+
+  # 80% CI: thicker inner interval
+  geom_linerange(
+    aes(ymin = CI80_low, ymax = CI80_high),
+    position = pd,
+    linewidth = 1.8
+  ) +
+
+  # Larger symbols for effect types
+  geom_point(
+    aes(shape = type),
+    position = pd,
+    size = 3.8
+  ) +
+
   geom_hline(yintercept = 0, linetype = "dashed") +
   coord_flip() +
-  
-  
+
   scale_color_manual(values = c("female" = "#b19cd9", "male" = "#6a0dad")) +
-  
+
   scale_shape_manual(values = c(
-    "Main Effects"   = 16, 
-    "Interaction"    = 18, 
-    "Simple Effects" = 15  
+    "Main Effects"   = 16,
+    "Interaction"    = 18,
+    "Simple Effects" = 15
   )) +
-  
-  # --- CONTROL LEGEND ORDER HERE ---
+
   guides(
-    shape = guide_legend(order = 1), # Effect Type on Top
-    color = guide_legend(order = 2)  # Sex Below
+    shape = guide_legend(order = 1, override.aes = list(size = 4.5)),
+    color = guide_legend(order = 2)
   ) +
-  
+
   theme_bw(base_size = 14) +
   theme(
     panel.grid.major.y = element_blank(),
     axis.text.y        = element_text(color = "black"),
     strip.text         = element_text(face = "bold"),
-    
-    # --- STACK LEGENDS VERTICALLY ---
     legend.position    = "bottom",
-    legend.box         = "vertical",  # Stacks the two legends
-    legend.margin      = margin(t = 0, b = 0, unit = "pt") # tighter spacing
+    legend.box         = "vertical",
+    legend.margin      = margin(t = 0, b = 0, unit = "pt"),
+    plot.margin        = margin(t = 10, r = 30, b = 10, l = 10, unit = "pt")
   ) +
   labs(
-    x = "", 
-    y = "Effect Estimate (% change)", 
-    color = "Sex", shape = "Effect Type"
-  )
-
-WAT_plot <- WAT_plot +
-  theme(
-    plot.margin = margin(
-      t = 10,
-      r = 30,  
-      b = 10,
-      l = 10,
-      unit = "pt"
-    )
+    x = "",
+    y = "Effect estimate (% change)",
+    color = "Sex",
+    shape = "Effect type"
   )
 
 # Save
 ggsave("WAT_effects_percent.jpeg", plot = WAT_plot, width = 6.5, height = 5, units = "in")
 
 WAT_plot
+
 ```
 
 
@@ -1373,9 +1464,6 @@ sig80_biomarkers_WAT <- WAT_slopes_inf %>%
 WAT_slopes_inf_sig80 <- WAT_slopes_inf %>%
   filter(biomarker %in% sig80_biomarkers_WAT)
 
-
-
-library(cowplot)
 
 WAT_Hp_figure <- plot_grid(
   p_Hp_forest_inf, p_WAT_forest_inf,
@@ -1701,6 +1789,9 @@ loo_compare(
 #fit_wat_diet -1.1       1.8   
 #fit_base     -2.1       1.8  
 ```
+
+
+
 
 
 ```{r}
@@ -2588,8 +2679,6 @@ Fig_S3ABC
 
 
 ```{r}
-
-
 # Create the layout
 Fig_S3DEF <- wrap_plots(
   MCP1_trajectories + theme(legend.position = "none") + labs(tag = "D"),
@@ -2618,3 +2707,4 @@ Fig_S3GHI <- wrap_plots(
 Fig_S3GHI
 
 ```
+
